@@ -1,0 +1,30 @@
+{
+  "datagolf_api_key": "08e3174ffc1aa79b54b9015a7aff",
+  "league": {
+    "my_team": "squeezer highcutts",
+    "my_owner": "matt roby",
+    "total_members": 0,
+    "segments": [
+      {
+        "name": "Segment 1",
+        "start_event": "Sony Open in Hawaii",
+        "end_event": "Arnold Palmer Invitational"
+      },
+      {
+        "name": "Segment 2",
+        "start_event": "THE PLAYERS Championship",
+        "end_event": "Miami Championship"
+      },
+      {
+        "name": "Segment 3",
+        "start_event": "Truist Championship",
+        "end_event": "Travelers Championship"
+      },
+      {
+        "name": "Segment 4",
+        "start_event": "John Deere Classic",
+        "end_event": "TOUR Championship"
+      }
+    ]
+  }
+}

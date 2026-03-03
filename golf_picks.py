@@ -123,7 +123,7 @@ ELEVATED_KEYWORDS = MAJOR_KEYWORDS + [
 # Commissioner's Cup — 8 signature events (partial name match)
 COMMISSIONER_CUP_KEYWORDS = [
     "pebble beach", "genesis invitational", "arnold palmer invitational",
-    "rbc heritage", "cadillac championship", "truist championship",
+    "rbc heritage", "miami championship", "truist championship",
     "memorial tournament", "travelers championship",
 ]
 
@@ -420,11 +420,11 @@ def fetch_predictions(api_key: str) -> dict:
         if not dg_id:
             continue
         result[dg_id] = {
-            "win_prob":      float(p.get("win")      or p.get("win_prob")  or 0),
-            "top5_prob":     float(p.get("top_5")    or p.get("top5")      or 0),
-            "top10_prob":    float(p.get("top_10")   or p.get("top10")     or 0),
-            "top20_prob":    float(p.get("top_20")   or p.get("top20")     or 0),
-            "make_cut_prob": float(p.get("make_cut") or p.get("mc")        or 70),
+            "win_prob":      float(p.get("win")      or p.get("win_prob")  or 0) * 100,
+            "top5_prob":     float(p.get("top_5")    or p.get("top5")      or 0) * 100,
+            "top10_prob":    float(p.get("top_10")   or p.get("top10")     or 0) * 100,
+            "top20_prob":    float(p.get("top_20")   or p.get("top20")     or 0) * 100,
+            "make_cut_prob": float(p.get("make_cut") or p.get("mc")        or 0.70) * 100,
         }
     return result
 
@@ -770,15 +770,16 @@ def pick_pct_label(pct: float) -> str:
     if pct >= 1.5:  return "low"
     return "contrarian"
 
-def my_standings_context(standings: dict, my_team: str) -> dict:
+def my_standings_context(standings: dict, my_team: str, my_owner: str = "") -> dict:
     """
     Find the user's position in each contest.
+    Matches on team name OR owner name (case-insensitive substring).
     Returns {contest: {rank, total, earnings, earnings_back, mode, pct_rank}}.
     mode is one of: 'chase' | 'conservative' | 'balanced'.
     """
-    if not my_team:
+    if not my_team and not my_owner:
         return {}
-    my_lower = my_team.lower()
+    needles = [s.lower() for s in [my_team, my_owner] if s]
     context: dict = {}
     for contest, entries in standings.items():
         if not entries:
@@ -786,7 +787,9 @@ def my_standings_context(standings: dict, my_team: str) -> dict:
         total = len(entries)
         my_entry = None
         for e in entries:
-            if my_lower in e["team"].lower() or my_lower in e["owner"].lower():
+            team_l  = e["team"].lower()
+            owner_l = e["owner"].lower()
+            if any(n in team_l or n in owner_l for n in needles):
                 my_entry = e
                 break
         if not my_entry:
@@ -832,6 +835,12 @@ def cmd_setup_league():
     if new_team:
         league["my_team"] = new_team
 
+    cur_owner = league.get("my_owner", "")
+    print(f"  Current owner name (as shown on MPSP): {cur_owner or '(not set)'}")
+    new_owner = input("  Your owner name (Enter to keep): ").strip()
+    if new_owner:
+        league["my_owner"] = new_owner
+
     cur_members = league.get("total_members", 0)
     print(f"\n  Current total league members: {cur_members or '(auto-detect from standings)'}")
     nm = input("  Total league members (Enter to auto-detect): ").strip()
@@ -864,13 +873,11 @@ def _events_in_segment(sched: list[dict], seg: dict) -> list[str]:
     for ev in sched:
         nl = ev.get("event_name", "").lower()
         if not in_seg:
-            if (start_kw in nl or nl in start_kw or
-                    difflib.SequenceMatcher(None, start_kw, nl).ratio() > 0.72):
+            if start_kw in nl or nl in start_kw:
                 in_seg = True
         if in_seg:
             names.append(ev.get("event_name", ""))
-            if (end_kw in nl or nl in end_kw or
-                    difflib.SequenceMatcher(None, end_kw, nl).ratio() > 0.72):
+            if end_kw in nl or nl in end_kw:
                 break
     return names
 
@@ -1895,6 +1902,7 @@ Modes: auto (default) | chase | conservative | balanced
 
     league_cfg = load_league_cfg()
     my_team    = league_cfg.get("my_team", "")
+    my_owner   = league_cfg.get("my_owner", "")
 
     # 1. Schedule
     print("  → Fetching PGA Tour schedule...")
@@ -1981,7 +1989,7 @@ Modes: auto (default) | chase | conservative | balanced
 
     # 10. Contest + strategy mode
     ev_contests = all_contests_for_event(t_name, sched, league_cfg)
-    standings_ctx = my_standings_context(standings, my_team) if my_team else {}
+    standings_ctx = my_standings_context(standings, my_team, my_owner) if (my_team or my_owner) else {}
 
     # Determine active contest (CLI override > event type > year)
     if args.contest:
