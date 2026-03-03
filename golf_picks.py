@@ -647,36 +647,33 @@ def fetch_mpsp_standings(force: bool = False) -> dict:
         if cached is not None:
             return cached
 
+    import datetime
+    year = datetime.date.today().year
     result: dict = {}
 
     # Year-long individual standings
     html = _html_get(f"{MPSP_BASE}/standings/individual")
-    result["year"] = _parse_standings_rows(html) if html else []
+    year_entries = _parse_standings_rows(html) if html else []
+    result["year"] = year_entries
 
-    # Contest-specific pages — try plausible URL patterns
-    contest_paths = [
-        ("majors", ["standings/majors_contest", "standings/majors",
-                    "standings/individual/majors"]),
-        ("cup",    ["standings/commissioners_cup", "standings/commissioner_cup",
-                    "standings/cup", "standings/individual/cup"]),
-        ("seg1",   ["standings/segment/1", "standings/segment1",
-                    "standings/individual/segment/1"]),
-        ("seg2",   ["standings/segment/2", "standings/segment2",
-                    "standings/individual/segment/2"]),
-        ("seg3",   ["standings/segment/3", "standings/segment3",
-                    "standings/individual/segment/3"]),
-        ("seg4",   ["standings/segment/4", "standings/segment4",
-                    "standings/individual/segment/4"]),
-    ]
-    for contest, paths in contest_paths:
-        entries: list = []
-        for path in paths:
-            html = _html_get(f"{MPSP_BASE}/{path}")
-            if html and len(html) > 500:
-                entries = _parse_standings_rows(html)
-                if entries:
-                    break
-        result[contest] = entries
+    # Commissioner's Cup — confirmed URL
+    html = _html_get(f"{MPSP_BASE}/standings/commissioners_cup")
+    result["cup"] = _parse_standings_rows(html) if html else []
+
+    # Majors — only available after first major (Masters) is played
+    html = _html_get(f"{MPSP_BASE}/standings/majors")
+    majors_entries = _parse_standings_rows(html) if html else []
+    result["majors"] = majors_entries
+
+    # Segment standings — site uses changePeriod(season, period) JS:
+    #   /standings/individual/{year}/{period}/
+    # Segment standings — site JS: changePeriod(season, period) →
+    #   /standings/individual/{year}/{period}/
+    # Period values: 0=Season, 1=Segment 1, 2=Segment 2, 3=Segment 3, 4=Segment 4
+    # Note: early in a segment the data will equal season standings (same events).
+    for seg_num in range(1, 5):
+        html = _html_get(f"{MPSP_BASE}/standings/individual/{year}/{seg_num}/")
+        result[f"seg{seg_num}"] = _parse_standings_rows(html) if html else []
 
     if result.get("year"):
         cache_write("mpsp_standings", result)
@@ -1167,12 +1164,26 @@ def _league_advantage(name: str, usage_data: dict, total_members: int) -> tuple[
     """
     if not usage_data or total_members <= 0:
         return 0.5, 0, 0.5   # Unknown — neutral
-    norm = _normalize_name(name)
+    norm = _normalize_name(name)          # e.g. "rory mcilroy"
+    last = norm.split()[-1] if norm else norm   # e.g. "mcilroy"
     usage_count = 0
-    for league_name, count in usage_data.items():
-        if difflib.SequenceMatcher(None, norm, league_name).ratio() > 0.78:
-            usage_count = count
-            break
+    # 1. Exact full-name match
+    if norm in usage_data:
+        usage_count = usage_data[norm]
+    else:
+        # 2. Last-name match: MPSP often stores just last name ("mcilroy")
+        #    or last-name with first initial ("b koepka"). Both share last token.
+        for league_name, count in usage_data.items():
+            league_last = league_name.split()[-1] if league_name else ""
+            if last == league_last:
+                usage_count = count
+                break
+        # 3. Fuzzy fallback for edge cases
+        if not usage_count:
+            for league_name, count in usage_data.items():
+                if difflib.SequenceMatcher(None, norm, league_name).ratio() > 0.78:
+                    usage_count = count
+                    break
     pct = min(usage_count / total_members, 1.0)
     return pct, usage_count, pct
 
@@ -1631,18 +1642,18 @@ def _print_contest_context(
         active_m = " ← FOCUS" if contest == active_contest else ""
         print(f"  {label:<24} #{rank:>3}/{total:<3}  ${earn:>12,.0f}{eb_str}  {m_tag}{active_m}{in_ev}")
 
-    mode_msgs = {
-        "chase":        "CHASE MODE — boosting win-probability weight. Swing for the fences.",
-        "conservative": "CONSERVATIVE MODE — boosting future-value weight. Protect your lead.",
-        "balanced":     "BALANCED MODE — standard scoring weights.",
+    mode_hints = {
+        "chase":        "you're behind — consider CHASE (high win-prob, contrarian picks)",
+        "conservative": "you're near the top — consider CONSERVATIVE (protect lead, future value)",
+        "balanced":     "you're mid-pack — consider BALANCED (standard weights)",
     }
-    print(f"\n  Active strategy [{CONTEST_LABELS.get(active_contest, active_contest)}]: "
-          f"{mode_msgs.get(mode, mode)}")
+    print(f"\n  Suggested for [{CONTEST_LABELS.get(active_contest, active_contest)}]: "
+          f"{mode_hints.get(mode, mode)}")
 
-def print_report(tournament: dict, picks: list[dict],
+def print_report(tournament: dict, scored_by_mode: dict,
                  used_count: int, rem: list[dict], sg_profile: dict = None,
                  standings_ctx: dict = None, ev_contests: list[str] = None,
-                 active_contest: str = "year", mode: str = "balanced"):
+                 active_contest: str = "year", auto_mode: str = "balanced"):
     W   = 78
     DIV = "═" * W
     DIV2= "─" * W
@@ -1690,39 +1701,72 @@ def print_report(tournament: dict, picks: list[dict],
             print(f"    • {ev['event_name']:<42} {ev['start_date']}  {p_m:>7}  [{tl}]")
 
     _print_contest_context(
-        standings_ctx or {}, ev_contests or [], active_contest, mode
+        standings_ctx or {}, ev_contests or [], active_contest, auto_mode
     )
 
-    print(f"\n{DIV}")
-    print(f"  TOP 10 RECOMMENDED PICKS  (score = 0–100)  [{mode.upper()} MODE]")
-    print(DIV)
-
-    if not picks:
+    # ── Three mode tables ─────────────────────────────────────────────────────
+    MODE_META = {
+        "conservative": ("🛡  CONSERVATIVE", "top 20% of standings — protect your position"),
+        "balanced":     ("⚖  BALANCED",      "mid-pack — balanced approach"),
+        "chase":        ("🔥 CHASE",          "bottom 35% — need to catch up"),
+    }
+    any_picks = any(scored_by_mode.get(m) for m in MODE_META)
+    if not any_picks:
         print("\n  No eligible picks found. Check your API key, cache, or used-player list.")
         print(DIV + "\n")
         return
 
-    # ── Quick-reference table ─────────────────────────────────────────────────
-    picks_src = picks[0].get("pick_pct_source", "") if picks else ""
-    src_note  = "actual" if picks_src == "actual" else "est."
-    print(f"\n  {'#':<4} {'Player':<26} {'Score':>6}  {'OWGR':>5}  {'Top10%':>6}  "
-          f"{'Pick%(' + src_note + ')':>12}  {'Leverage'}")
-    print(f"  {'-'*4} {'-'*26} {'-'*6}  {'-'*5}  {'-'*6}  {'-'*12}  {'-'*10}")
-    for rank, p in enumerate(picks[:10], 1):
-        elite   = "★" if p["is_elite"] else " "
-        name    = (p["name"].title() if "," not in p["name"]
-                   else f"{p['name'].split(',')[1].strip()} {p['name'].split(',')[0].strip()}".title())
-        pct     = p.get("pick_pct", 0.0)
-        lv_lbl  = pick_pct_label(pct)
-        print(f"  {rank:<4} {elite}{name:<25} {p['final_score']:>6.1f}  "
-              f"#{p['owgr']:<4}  {p['top10_prob']:>5.1f}%  "
-              f"{pct:>10.1f}%  {lv_lbl}")
-    print()
+    for mode_name in ["conservative", "balanced", "chase"]:
+        mode_picks = scored_by_mode.get(mode_name, [])
+        if not mode_picks:
+            continue
+        label, desc = MODE_META[mode_name]
+        suggested = "  ◄ SUGGESTED" if mode_name == auto_mode else ""
+        print(f"\n{DIV}")
+        print(f"  {label}  ({desc}){suggested}")
+        print(DIV)
+        src_note = "actual" if mode_picks[0].get("pick_pct_source") == "actual" else "est."
+        print(f"\n  {'#':<4} {'Player':<26} {'Score':>6}  {'OWGR':>5}  {'Top10%':>6}  "
+              f"{'Pick%(' + src_note + ')':>12}  {'Leverage'}")
+        print(f"  {'-'*4} {'-'*26} {'-'*6}  {'-'*5}  {'-'*6}  {'-'*12}  {'-'*10}")
+        for rank, p in enumerate(mode_picks[:5], 1):
+            elite = "★" if p["is_elite"] else " "
+            name  = (p["name"].title() if "," not in p["name"]
+                     else f"{p['name'].split(',')[1].strip()} {p['name'].split(',')[0].strip()}".title())
+            pct   = p.get("pick_pct", 0.0)
+            print(f"  {rank:<4} {elite}{name:<25} {p['final_score']:>6.1f}  "
+                  f"#{p['owgr']:<4}  {p['top10_prob']:>5.1f}%  "
+                  f"{pct:>10.1f}%  {pick_pct_label(pct)}")
 
-    for rank, p in enumerate(picks[:10], 1):
-        flag   = "  ⚠  SAVE FOR LATER" if p.get("save_for_later") else ""
-        elite  = "★ " if p["is_elite"] else "  "
-        print(f"\n  #{rank}  {elite}{p['name'].upper()}{flag}")
+    # ── Build union of top-5 candidates, sorted by balanced score ─────────────
+    seen_names: set = set()
+    all_candidates: list = []
+    for mode_name in ["conservative", "balanced", "chase"]:
+        for p in scored_by_mode.get(mode_name, [])[:5]:
+            if p["name"] not in seen_names:
+                seen_names.add(p["name"])
+                all_candidates.append(p)
+    balanced_rank = {p["name"]: p["final_score"] for p in scored_by_mode.get("balanced", [])}
+    all_candidates.sort(key=lambda p: balanced_rank.get(p["name"], 0), reverse=True)
+
+    def _mode_tags(name: str) -> str:
+        parts = []
+        for mn, short in [("conservative", "CON"), ("balanced", "BAL"), ("chase", "CHZ")]:
+            for r, p in enumerate(scored_by_mode.get(mn, [])[:5], 1):
+                if p["name"] == name:
+                    parts.append(f"{short}#{r}")
+                    break
+        return "  [" + " · ".join(parts) + "]" if parts else ""
+
+    print(f"\n{DIV}")
+    print(f"  PLAYER PROFILES  ({len(all_candidates)} candidates across all modes)")
+    print(DIV)
+
+    for p in all_candidates:
+        mode_tag = _mode_tags(p["name"])
+        flag     = "  ⚠  SAVE FOR LATER" if p.get("save_for_later") else ""
+        elite    = "★ " if p["is_elite"] else "  "
+        print(f"\n  {elite}{p['name'].upper()}{mode_tag}{flag}")
         print(DIV2)
 
         # Score bar
@@ -1798,7 +1842,7 @@ def print_report(tournament: dict, picks: list[dict],
             print(f"  WHY NOW : {wrapped}")
 
     print(f"\n{DIV}")
-    _print_summary(picks[:10], tournament, rem)
+    _print_summary(all_candidates, tournament, rem)
     print(f"{DIV}\n")
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2024,7 +2068,7 @@ Modes: auto (default) | chase | conservative | balanced
         print()
         return
 
-    # 11. Score — first pass without pick_pct (need scored list to estimate)
+    # 11. Score — first pass with balanced weights to estimate pick %
     print("  → Scoring eligible players...")
     scored_prelim = score_field(
         field=field,
@@ -2037,48 +2081,57 @@ Modes: auto (default) | chase | conservative | balanced
         sg_override=sg_override,
         usage_data=usage_data,
         total_members=total_members,
-        active_weights=active_weights,
+        active_weights=get_weights_for_mode("balanced"),
         pick_data=pick_data if picks_available else None,
     )
-    # If no actual pick data, estimate pick % from win probs, then rescore
+    # Estimate pick % from win probs if deadline hasn't passed yet
     if not picks_available and scored_prelim:
         est_pcts = estimate_pick_pcts(scored_prelim, total_members)
     else:
         est_pcts = None
-    scored = score_field(
-        field=field,
-        rankings=rankings,
-        predictions=predictions,
-        tournament=tournament,
-        rem_schedule=rem,
-        course_history=course_history,
-        used_lower=used_lower,
-        sg_override=sg_override,
-        usage_data=usage_data,
-        total_members=total_members,
-        active_weights=active_weights,
-        pick_data=pick_data if picks_available else None,
-        picks_estimated=est_pcts,
-    )
-    print(f"     {len(scored)} eligible players scored\n")
 
-    if not scored:
+    # Score once per mode so user can choose
+    scored_by_mode: dict = {}
+    for mode_name in ["conservative", "balanced", "chase"]:
+        scored_by_mode[mode_name] = score_field(
+            field=field,
+            rankings=rankings,
+            predictions=predictions,
+            tournament=tournament,
+            rem_schedule=rem,
+            course_history=course_history,
+            used_lower=used_lower,
+            sg_override=sg_override,
+            usage_data=usage_data,
+            total_members=total_members,
+            active_weights=get_weights_for_mode(mode_name),
+            pick_data=pick_data if picks_available else None,
+            picks_estimated=est_pcts,
+        )
+    n_scored = len(scored_by_mode.get("balanced", []))
+    print(f"     {n_scored} eligible players scored\n")
+
+    if not n_scored:
         print("  No eligible players to recommend.")
         print("  (All players may be used, or data may be missing.)")
         sys.exit(0)
 
-    # 12. Add reasoning for top 10
-    for p in scored[:10]:
-        p["reason"] = generate_reason(p, tournament, rem)
+    # Generate reasons for union of top-5 across all modes
+    seen_names: set = set()
+    for mode_name in ["conservative", "balanced", "chase"]:
+        for p in scored_by_mode[mode_name][:5]:
+            if p["name"] not in seen_names:
+                seen_names.add(p["name"])
+                p["reason"] = generate_reason(p, tournament, rem)
 
-    # 13. Print report
+    # 12. Print report
     print_report(
-        tournament, scored, used_count, rem,
+        tournament, scored_by_mode, used_count, rem,
         sg_profile=sg_override,
         standings_ctx=standings_ctx,
         ev_contests=ev_contests,
         active_contest=active_contest,
-        mode=mode,
+        auto_mode=mode,
     )
 
 
