@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Golf Picks Advisor</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;color:#cbd5e1;min-height:100vh;padding:16px 20px}
+h1{color:#38bdf8;font-size:20px;font-weight:700;margin-bottom:4px}
+.sub{font-size:13px;color:#64748b;margin-bottom:14px}
+
+/* ── Banner ── */
+.banner{background:#1e293b;border-left:3px solid #38bdf8;border-radius:6px;padding:10px 14px;margin-bottom:16px;font-size:13px;display:flex;flex-wrap:wrap;gap:6px 20px}
+.banner b{color:#38bdf8}
+.standings{color:#94a3b8;font-size:12px;margin-top:4px;width:100%}
+
+/* ── Layout ── */
+.layout{display:grid;grid-template-columns:340px 1fr;gap:16px;align-items:start}
+@media(max-width:900px){.layout{grid-template-columns:1fr}}
+
+/* ── Cards ── */
+.card{background:#1e293b;border-radius:8px;padding:14px 16px;margin-bottom:12px}
+.card-title{font-size:11px;font-weight:700;letter-spacing:.8px;text-transform:uppercase;color:#475569;margin-bottom:10px}
+
+/* ── Sliders ── */
+.slider-row{display:flex;align-items:center;gap:8px;margin-bottom:7px}
+.slider-row label{width:120px;font-size:12px;color:#94a3b8;flex-shrink:0}
+.slider-row input[type=range]{flex:1;height:4px;accent-color:#38bdf8;cursor:pointer}
+.slider-val{width:38px;text-align:right;font-size:12px;font-weight:700;color:#38bdf8}
+.sum-row{font-size:11px;margin-top:6px;padding:5px 8px;border-radius:4px;background:#0f172a;display:flex;justify-content:space-between;align-items:center}
+.sum-ok{color:#4ade80}.sum-warn{color:#fb923c}
+
+/* ── Presets ── */
+.preset-row{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:10px}
+.preset-btn{font-size:11px;padding:3px 9px;border:1px solid #334155;background:#0f172a;color:#94a3b8;border-radius:4px;cursor:pointer}
+.preset-btn:hover{border-color:#38bdf8;color:#38bdf8}
+
+/* ── Mode tabs ── */
+.tabs{display:flex;gap:4px;margin-bottom:10px}
+.tab{padding:5px 12px;border:none;border-radius:5px;font-size:12px;font-weight:600;cursor:pointer;background:#0f172a;color:#64748b;transition:all .15s}
+.tab.t-con.active{background:#1d4ed8;color:#fff}
+.tab.t-bal.active{background:#b45309;color:#fff}
+.tab.t-cha.active{background:#b91c1c;color:#fff}
+.mode-panel{display:none}.mode-panel.active{display:block}
+
+/* ── Buttons ── */
+.btn-run{width:100%;padding:11px;background:#38bdf8;color:#0f172a;border:none;border-radius:7px;font-size:15px;font-weight:700;cursor:pointer;margin-bottom:8px;transition:background .15s}
+.btn-run:hover{background:#7dd3fc}
+.btn-run:disabled{background:#334155;color:#64748b;cursor:default}
+.btn-reset{width:100%;padding:8px;background:transparent;color:#64748b;border:1px solid #334155;border-radius:7px;font-size:13px;cursor:pointer}
+.btn-reset:hover{color:#94a3b8;border-color:#475569}
+
+/* ── Results ── */
+.results-placeholder{border:2px dashed #1e293b;border-radius:8px;padding:60px 20px;text-align:center;color:#334155;font-size:14px}
+.spinner{display:none;text-align:center;padding:40px;color:#38bdf8;font-size:14px}
+.spinner.active{display:block}
+@keyframes spin{to{transform:rotate(360deg)}}
+.spin-icon{display:inline-block;animation:spin .8s linear infinite;font-size:22px;margin-bottom:8px}
+
+.mode-block{margin-bottom:20px}
+.mode-header{padding:9px 14px;border-radius:6px 6px 0 0;font-size:13px;font-weight:700;display:flex;justify-content:space-between;align-items:center}
+.mh-con{background:#1d4ed8}.mh-bal{background:#92400e}.mh-cha{background:#991b1b}
+.mode-header small{font-weight:400;font-size:11px;opacity:.8}
+
+table{width:100%;border-collapse:collapse;background:#1e293b;border-radius:0 0 6px 6px;overflow:hidden}
+th{background:#0f172a;padding:7px 10px;font-size:11px;font-weight:600;color:#475569;text-align:left;white-space:nowrap}
+td{padding:7px 10px;font-size:12px;border-bottom:1px solid #0f172a;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:#162032}
+.td-rank{color:#475569;font-weight:600}
+.td-star{color:#fbbf24}
+.td-score{font-weight:700;color:#38bdf8}
+.td-diff{color:#a78bfa;font-weight:600}
+.lev-CHALK{color:#f87171}.lev-popular{color:#fb923c}.lev-moderate{color:#facc15}
+.lev-low{color:#86efac}.lev-contrarian{color:#67e8f9}
+
+.results-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+@media(max-width:1100px){.results-grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<h1>⛳ Golf One-and-Done Picks Advisor</h1>
+<div class="sub">Interactive weight tuner — adjust sliders and hit Run Model</div>
+
+<div class="banner">
+  <span><b>TOURNAMENT</b> __TOURNAMENT_NAME__</span>
+  <span><b>COURSE</b> __COURSE__</span>
+  <span><b>PURSE</b> __PURSE__</span>
+  <span><b>FIELD</b> __FIELD_SIZE__ players</span>
+  <div class="standings">__STANDINGS__</div>
+</div>
+
+<div class="layout">
+
+  <!-- ── LEFT: CONTROLS ───────────────────────────────────────────────── -->
+  <div>
+
+    <!-- Course SG Profile -->
+    <div class="card">
+      <div class="card-title">Course SG Profile — __COURSE__ <span id="profile-type" style="color:#38bdf8;font-size:10px"></span></div>
+      <div class="preset-row" id="preset-row"></div>
+      <div id="sg-sliders"></div>
+      <div class="sum-row">
+        <span>Sum</span>
+        <span id="sg-sum" class="sum-ok">100%</span>
+      </div>
+      <div style="font-size:10px;color:#475569;margin-top:6px">Weights are normalized automatically if they don't sum to 100%</div>
+    </div>
+
+    <!-- Scoring Component Weights -->
+    <div class="card">
+      <div class="card-title">Scoring Component Weights</div>
+      <div class="tabs">
+        <button class="tab t-con active" onclick="switchTab('conservative',this)">🛡 Conservative</button>
+        <button class="tab t-bal"        onclick="switchTab('balanced',this)">⚖ Balanced</button>
+        <button class="tab t-cha"        onclick="switchTab('chase',this)">🔥 Chase</button>
+      </div>
+      <div id="mode-panels"></div>
+    </div>
+
+    <button class="btn-run" id="run-btn" onclick="runModel()">▶ Run Model</button>
+    <button class="btn-reset" onclick="resetAll()">↺ Reset to Baseline</button>
+  </div>
+
+  <!-- ── RIGHT: RESULTS ───────────────────────────────────────────────── -->
+  <div>
+    <div id="results-placeholder" class="results-placeholder">
+      Adjust weights and click <b>Run Model</b> to see your picks.<br><br>
+      The model scores all eligible players instantly — no API calls needed.
+    </div>
+    <div class="spinner" id="spinner">
+      <div class="spin-icon">⟳</div><br>Scoring field with your weights...
+    </div>
+    <div id="results-content"></div>
+  </div>
+
+</div><!-- /layout -->
+
+<script>
+// ── Injected baseline ──────────────────────────────────────────────────────
+const BASELINE = __BASELINE_JSON__;
+
+// Deep copy for current state
+let cur = JSON.parse(JSON.stringify(BASELINE));
+
+// ── Constants ─────────────────────────────────────────────────────────────
+const SG_KEYS   = ['sg_ott','sg_app','sg_arg','sg_putt'];
+const SG_LABELS = {sg_ott:'Off The Tee',sg_app:'Approach',sg_arg:'Around Green',sg_putt:'Putting'};
+
+const COMP_KEYS   = ['win_top10','course_fit','future_value','purse_size','league_advantage','pick_leverage'];
+const COMP_LABELS = {
+  win_top10:'Win / Top-10',course_fit:'Course Fit',future_value:'Future Value',
+  purse_size:'Purse Size',league_advantage:'League Advantage',pick_leverage:'Pick Leverage'
+};
+const COMP_TIPS = {
+  win_top10:'Raw win probability + top-10 probability this week',
+  course_fit:'SG profile match vs course demands + course history',
+  future_value:'Expected future earnings at upcoming elite events',
+  purse_size:'How large this week\'s purse is vs season average',
+  league_advantage:'How rare your access to this player is (fewer owners = edge)',
+  pick_leverage:'Contrarian value — lower pick% = more ground gained when they score'
+};
+const MODES = ['conservative','balanced','chase'];
+const PRESETS = {
+  'Approach': {sg_ott:.10,sg_app:.55,sg_arg:.15,sg_putt:.20},
+  'Driving':  {sg_ott:.55,sg_app:.25,sg_arg:.10,sg_putt:.10},
+  'Putting':  {sg_ott:.10,sg_app:.20,sg_arg:.20,sg_putt:.50},
+  'ARG':      {sg_ott:.10,sg_app:.25,sg_arg:.45,sg_putt:.20},
+  'Balanced': {sg_ott:.25,sg_app:.35,sg_arg:.15,sg_putt:.25},
+  'Ball-striking':{sg_ott:.35,sg_app:.45,sg_arg:.10,sg_putt:.10},
+};
+
+// ── Build SG sliders ───────────────────────────────────────────────────────
+function buildSgSliders() {
+  // Presets
+  const pr = document.getElementById('preset-row');
+  pr.innerHTML = '';
+  for (const [label, vals] of Object.entries(PRESETS)) {
+    const b = document.createElement('button');
+    b.className = 'preset-btn';
+    b.textContent = label;
+    b.onclick = () => applySgPreset(vals);
+    pr.appendChild(b);
+  }
+  // Profile type label
+  document.getElementById('profile-type').textContent = '(__PROFILE_TYPE__)';
+
+  const cont = document.getElementById('sg-sliders');
+  cont.innerHTML = '';
+  for (const k of SG_KEYS) {
+    const v = Math.round((cur.sg[k] || 0) * 100);
+    cont.innerHTML += `
+      <div class="slider-row">
+        <label title="${SG_LABELS[k]}">${SG_LABELS[k]}</label>
+        <input type="range" id="sg_${k}" min="0" max="100" step="1" value="${v}"
+               oninput="onSg('${k}',this.value)">
+        <span class="slider-val" id="sg_${k}_v">${v}%</span>
+      </div>`;
+  }
+  updateSgSum();
+}
+
+function applySgPreset(vals) {
+  for (const k of SG_KEYS) {
+    cur.sg[k] = vals[k] || 0;
+    const el = document.getElementById('sg_'+k);
+    const vl = document.getElementById('sg_'+k+'_v');
+    if (el) { el.value = Math.round(vals[k]*100); vl.textContent = Math.round(vals[k]*100)+'%'; }
+  }
+  updateSgSum();
+}
+
+function onSg(k, v) {
+  cur.sg[k] = parseInt(v)/100;
+  document.getElementById('sg_'+k+'_v').textContent = v+'%';
+  updateSgSum();
+}
+
+function updateSgSum() {
+  const total = SG_KEYS.reduce((s,k)=>s+Math.round((cur.sg[k]||0)*100),0);
+  const el = document.getElementById('sg-sum');
+  el.textContent = total+'%';
+  el.className = total===100 ? 'sum-ok' : 'sum-warn';
+}
+
+// ── Build mode weight panels ───────────────────────────────────────────────
+function buildModePanels() {
+  const cont = document.getElementById('mode-panels');
+  cont.innerHTML = '';
+  for (const mode of MODES) {
+    let html = `<div class="mode-panel${mode==='conservative'?' active':''}" id="panel_${mode}">`;
+    const w = cur.weights[mode];
+    for (const k of COMP_KEYS) {
+      const v = Math.round((w[k]||0)*100);
+      html += `
+        <div class="slider-row">
+          <label title="${COMP_TIPS[k]}">${COMP_LABELS[k]}</label>
+          <input type="range" id="${mode}_${k}" min="0" max="60" step="1" value="${v}"
+                 oninput="onWeight('${mode}','${k}',this.value)">
+          <span class="slider-val" id="${mode}_${k}_v">${v}%</span>
+        </div>`;
+    }
+    html += `<div class="sum-row">
+      <span>Sum</span>
+      <span id="sum_${mode}" class="sum-ok">—</span>
+    </div></div>`;
+    cont.innerHTML += html;
+    // compute sum after render
+    setTimeout(()=>updateWeightSum(mode), 0);
+  }
+}
+
+let _activeTab = 'conservative';
+function switchTab(mode, btn) {
+  _activeTab = mode;
+  document.querySelectorAll('.mode-panel').forEach(p=>p.classList.remove('active'));
+  document.getElementById('panel_'+mode).classList.add('active');
+  document.querySelectorAll('.tab').forEach(b=>{
+    b.classList.remove('active');
+  });
+  btn.classList.add('active');
+}
+
+function onWeight(mode, k, v) {
+  cur.weights[mode][k] = parseInt(v)/100;
+  document.getElementById(`${mode}_${k}_v`).textContent = v+'%';
+  updateWeightSum(mode);
+}
+
+function updateWeightSum(mode) {
+  const total = COMP_KEYS.reduce((s,k)=>s+Math.round((cur.weights[mode][k]||0)*100),0);
+  const el = document.getElementById('sum_'+mode);
+  if (!el) return;
+  const ok = Math.abs(total-100)<2;
+  el.textContent = total+'%' + (ok ? ' ✓' : ' ⚠ (will normalize)');
+  el.className = ok ? 'sum-ok' : 'sum-warn';
+}
+
+// ── Reset ──────────────────────────────────────────────────────────────────
+function resetAll() {
+  cur = JSON.parse(JSON.stringify(BASELINE));
+  buildSgSliders();
+  buildModePanels();
+}
+
+// ── Run Model ──────────────────────────────────────────────────────────────
+async function runModel() {
+  const btn = document.getElementById('run-btn');
+  btn.disabled = true;
+  document.getElementById('results-placeholder').style.display = 'none';
+  document.getElementById('results-content').innerHTML = '';
+  document.getElementById('spinner').classList.add('active');
+
+  try {
+    const resp = await fetch('/run', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(cur)
+    });
+    if (!resp.ok) throw new Error('Server error '+resp.status);
+    const data = await resp.json();
+    renderResults(data);
+  } catch(e) {
+    document.getElementById('results-content').innerHTML =
+      `<div style="color:#f87171;padding:20px">Error: ${e.message}</div>`;
+  } finally {
+    document.getElementById('spinner').classList.remove('active');
+    btn.disabled = false;
+  }
+}
+
+// ── Render results ─────────────────────────────────────────────────────────
+const MODE_META = {
+  conservative: {label:'🛡 Conservative', cls:'mh-con', desc:'Protect position — floor & future value'},
+  balanced:     {label:'⚖ Balanced',      cls:'mh-bal', desc:'Standard balanced approach'},
+  chase:        {label:'🔥 Chase',         cls:'mh-cha', desc:'Differentiate — DiffWin% = exclusive upside'},
+};
+
+function renderResults(data) {
+  let html = '<div class="results-grid">';
+  for (const mode of MODES) {
+    const picks = data[mode] || [];
+    const meta  = MODE_META[mode];
+    const isChase = mode === 'chase';
+    html += `
+      <div class="mode-block">
+        <div class="mode-header ${meta.cls}">
+          <span>${meta.label}</span>
+          <small>${meta.desc}</small>
+        </div>
+        <table>
+          <thead><tr>
+            <th>#</th><th>Player</th><th>Score</th>
+            ${isChase
+              ? '<th>Win%</th><th>T10%</th><th>Pick%</th><th title="Win% × (1 − Pick%) — exclusive upside">DiffWin%</th><th>Leverage</th>'
+              : '<th>OWGR</th><th>T10%</th><th>Pick%</th><th>Leverage</th>'}
+          </tr></thead>
+          <tbody>`;
+    picks.forEach((p, i) => {
+      const star     = p.is_elite ? '<span class="td-star">★</span>' : '';
+      const lev      = p.lev_label;
+      const diffWin  = (p.win_prob * (1 - p.pick_pct/100)).toFixed(1);
+      html += `<tr>
+        <td class="td-rank">${i+1}</td>
+        <td>${star}${p.name}</td>
+        <td class="td-score">${p.final_score}</td>`;
+      if (isChase) {
+        html += `<td>${p.win_prob}%</td>
+                 <td>${p.top10_prob}%</td>
+                 <td class="lev-${lev}">${p.pick_pct}%</td>
+                 <td class="td-diff">${diffWin}%</td>
+                 <td class="lev-${lev}">${lev}</td>`;
+      } else {
+        html += `<td>#${p.owgr}</td>
+                 <td>${p.top10_prob}%</td>
+                 <td class="lev-${lev}">${p.pick_pct}%</td>
+                 <td class="lev-${lev}">${lev}</td>`;
+      }
+      html += `</tr>`;
+    });
+    html += `</tbody></table></div>`;
+  }
+  html += '</div>';
+  document.getElementById('results-content').innerHTML = html;
+}
+
+// ── Init ───────────────────────────────────────────────────────────────────
+buildSgSliders();
+buildModePanels();
+</script>
+</body>
+</html>
