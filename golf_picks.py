@@ -2582,8 +2582,8 @@ def cmd_ui(args):
                 self.send_response(404); self.end_headers()
 
     PORT   = 5051
-    server = HTTPServer(("localhost", PORT), Handler)
-    url    = f"http://localhost:{PORT}"
+    server = HTTPServer(("0.0.0.0", PORT), Handler)   # bind all interfaces (IPv4 + IPv6)
+    url    = f"http://127.0.0.1:{PORT}"               # use explicit IP to avoid macOS IPv6 issue
     print(f"  Web UI ready →  {url}")
     print(f"  Serving {t_name}  |  {total_members} league members")
     print(f"  Press Ctrl+C to stop.\n")
