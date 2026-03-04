@@ -77,6 +77,66 @@ tr:hover td{background:#162032}
 
 .results-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
 @media(max-width:1100px){.results-grid{grid-template-columns:1fr}}
+
+/* ── Headshots & badges ── */
+.player-cell{display:flex;align-items:center;gap:8px}
+.headshot{width:36px;height:36px;border-radius:50%;object-fit:cover;background:#0f172a;flex-shrink:0;border:1px solid #334155}
+.headshot-init{width:36px;height:36px;border-radius:50%;background:#1d4ed8;color:#fff;font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;border:1px solid #334155}
+.player-name-wrap{display:flex;flex-direction:column;gap:1px}
+.badges{display:flex;gap:4px;align-items:center;flex-wrap:wrap}
+.badge-form{font-size:13px;line-height:1}
+.badge-save{font-size:10px;font-weight:700;background:#854d0e;color:#fde68a;padding:1px 5px;border-radius:3px;white-space:nowrap}
+
+/* ── Weather ── */
+.weather-banner{font-size:12px;padding:8px 14px;border-radius:6px;margin-bottom:12px;display:flex;align-items:center;gap:10px;font-weight:600}
+.wx-calm{background:#0c2340;border-left:3px solid #38bdf8;color:#93c5fd}
+.wx-windy{background:#1c1a08;border-left:3px solid #fbbf24;color:#fde68a}
+.wx-very_windy,.wx-storm{background:#1f0a0a;border-left:3px solid #f87171;color:#fca5a5}
+.wx-rainy{background:#0f1a2e;border-left:3px solid #818cf8;color:#c4b5fd}
+.wx-icon{font-size:18px}
+
+/* ── Contest selector ── */
+.contest-row{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.contest-row label{font-size:12px;color:#94a3b8;flex-shrink:0}
+.contest-select{background:#0f172a;color:#cbd5e1;border:1px solid #334155;border-radius:5px;padding:4px 8px;font-size:12px;cursor:pointer;flex:1}
+.contest-select:focus{outline:none;border-color:#38bdf8}
+
+/* ── Expandable best-fit spots ── */
+.player-row{cursor:pointer;transition:background .1s}
+.player-row:hover td{background:#1a2535 !important}
+.expand-icon{display:inline-block;font-size:9px;color:#334155;margin-right:5px;transition:transform .2s;vertical-align:middle}
+.expand-icon.open{transform:rotate(90deg);color:#38bdf8}
+.spots-row{display:none}
+.spots-row td{background:#0a1120;padding:0 !important;border-bottom:2px solid #1e293b !important}
+.spots-detail{padding:10px 14px 14px 14px}
+.spots-label{font-size:10px;font-weight:700;letter-spacing:.6px;color:#475569;margin-bottom:8px;text-transform:uppercase}
+/* Flex rows — no nested table, avoids overflow:hidden clipping */
+.spot-item{display:flex;align-items:center;gap:10px;padding:5px 2px;border-bottom:1px solid #1a2535;font-size:11px}
+.spot-item:last-child{border-bottom:none}
+.spot-name{flex:1;color:#94a3b8;font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.spot-date{width:48px;color:#64748b;flex-shrink:0;text-align:right}
+.spot-purse{width:44px;color:#64748b;flex-shrink:0;text-align:right}
+.spot-tier{width:64px;flex-shrink:0}
+.spot-type{width:90px;color:#64748b;font-size:10px;text-transform:capitalize;flex-shrink:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.t-major{color:#fbbf24;font-weight:700}
+.t-premium{color:#a78bfa;font-weight:600}
+.t-elevated{color:#67e8f9}
+.t-std{color:#475569}
+.fit-bar-wrap{display:flex;align-items:center;gap:5px;width:96px;flex-shrink:0}
+.fit-bar{height:5px;border-radius:2px;min-width:4px}
+
+/* ── History ── */
+.history-section{margin-top:24px}
+.history-toggle{background:none;border:none;color:#475569;font-size:12px;cursor:pointer;padding:6px 0;display:flex;align-items:center;gap:6px}
+.history-toggle:hover{color:#94a3b8}
+.history-table{width:100%;border-collapse:collapse;margin-top:8px;font-size:12px}
+.history-table th{background:#0f172a;padding:6px 10px;color:#475569;text-align:left;font-weight:600}
+.history-table td{padding:6px 10px;border-bottom:1px solid #1e293b;color:#94a3b8}
+.history-table tr:last-child td{border-bottom:none}
+.finish-good{color:#4ade80;font-weight:700}
+.finish-mc{color:#f87171}
+.finish-ok{color:#fbbf24}
+.history-empty{color:#334155;font-size:13px;padding:16px 0;text-align:center}
 </style>
 </head>
 <body>
@@ -91,6 +151,8 @@ tr:hover td{background:#162032}
   <span><b>FIELD</b> __FIELD_SIZE__ players</span>
   <div class="standings">__STANDINGS__</div>
 </div>
+
+<div id="weather-banner" style="display:none"></div>
 
 <div class="layout">
 
@@ -120,6 +182,16 @@ tr:hover td{background:#162032}
       <div id="mode-panels"></div>
     </div>
 
+    <!-- Contest selector (#5) -->
+    <div class="card" style="padding:10px 14px">
+      <div class="card-title">Optimize For Contest</div>
+      <div class="contest-row">
+        <label>Contest</label>
+        <select class="contest-select" id="contest-select"></select>
+      </div>
+      <div style="font-size:10px;color:#475569">Changes which remaining events count toward future value score</div>
+    </div>
+
     <button class="btn-run" id="run-btn" onclick="runModel()">▶ Run Model</button>
     <button class="btn-reset" onclick="resetAll()">↺ Reset to Baseline</button>
   </div>
@@ -134,20 +206,39 @@ tr:hover td{background:#162032}
       <div class="spin-icon">⟳</div><br>Scoring field with your weights...
     </div>
     <div id="results-content"></div>
+
+    <!-- Pick History (#4) -->
+    <div class="history-section">
+      <button class="history-toggle" onclick="toggleHistory()">
+        <span id="history-arrow">▶</span> Pick History
+      </button>
+      <div id="history-content" style="display:none"></div>
+    </div>
   </div>
 
 </div><!-- /layout -->
 
 <script>
-// ── Injected baseline ──────────────────────────────────────────────────────
-const BASELINE = __BASELINE_JSON__;
-
-// Deep copy for current state
-let cur = JSON.parse(JSON.stringify(BASELINE));
+// ── Baseline (fetched from server) ─────────────────────────────────────────
+let BASELINE = null;
+let cur = null;
 
 // ── Constants ─────────────────────────────────────────────────────────────
 const SG_KEYS   = ['sg_ott','sg_app','sg_arg','sg_putt'];
 const SG_LABELS = {sg_ott:'Off The Tee',sg_app:'Approach',sg_arg:'Around Green',sg_putt:'Putting'};
+
+const WX_ICONS = {calm:'🌤️', windy:'💨', very_windy:'🌬️', rainy:'🌧️', storm:'⛈️'};
+
+const CONTEST_ORDER  = ['year','cup','majors','seg1','seg2','seg3','seg4'];
+const CONTEST_LABELS_JS = {
+  year:   'Year-Long',
+  cup:    "Commissioner's Cup",
+  majors: 'Majors Only',
+  seg1:   'Segment 1',
+  seg2:   'Segment 2',
+  seg3:   'Segment 3',
+  seg4:   'Segment 4',
+};
 
 const COMP_KEYS   = ['win_top10','course_fit','future_value','purse_size','league_advantage','pick_leverage'];
 const COMP_LABELS = {
@@ -182,6 +273,17 @@ function buildSgSliders() {
     b.className = 'preset-btn';
     b.textContent = label;
     b.onclick = () => applySgPreset(vals);
+    pr.appendChild(b);
+  }
+  // Weather-adjusted preset (if available)
+  if (BASELINE && BASELINE.weather_sg) {
+    const b = document.createElement('button');
+    b.className = 'preset-btn';
+    b.style.cssText = 'border-color:#818cf8;color:#c4b5fd';
+    const wx = BASELINE.weather || {};
+    b.textContent = (WX_ICONS[wx.condition] || '🌤️') + ' Weather Adj.';
+    b.title = `Auto-adjusted for ${wx.condition || 'conditions'}: ${wx.wind_mph_max||0}mph wind, ${wx.precip_mm_total||0}mm rain`;
+    b.onclick = () => applySgPreset(BASELINE.weather_sg);
     pr.appendChild(b);
   }
   // Profile type label
@@ -294,13 +396,16 @@ async function runModel() {
   document.getElementById('spinner').classList.add('active');
 
   try {
+    const contest = document.getElementById('contest-select')?.value || 'year';
+    const payload = Object.assign({}, cur, { contest });
     const resp = await fetch('/run', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify(cur)
+      body: JSON.stringify(payload)
     });
     if (!resp.ok) throw new Error('Server error '+resp.status);
     const data = await resp.json();
+    console.log('[golf] future_spots sample:', JSON.stringify(data?.conservative?.[0]?.future_spots));
     renderResults(data);
   } catch(e) {
     document.getElementById('results-content').innerHTML =
@@ -318,12 +423,67 @@ const MODE_META = {
   chase:        {label:'🔥 Chase',         cls:'mh-cha', desc:'Differentiate — DiffWin% = exclusive upside'},
 };
 
+// ── Best-fit spots detail row ───────────────────────────────────────────────
+const TIER_META = {
+  5: {label:'MAJOR',      cls:'t-major'},
+  4: {label:'Premium',    cls:'t-premium'},
+  3: {label:'Elevated+',  cls:'t-elevated'},
+  2: {label:'Elevated',   cls:'t-elevated'},
+  1: {label:'Standard',   cls:'t-std'},
+};
+
+function buildSpotsHtml(spots, colCount) {
+  if (!spots || !spots.length) {
+    return `<td colspan="${colCount}" style="background:#0a1120;padding:0 !important"><div class="spots-detail">
+      <div class="spots-label">Top Upcoming Fits</div>
+      <div style="color:#94a3b8;font-size:12px">No upcoming events found — restart the server to refresh schedule data.</div>
+    </div></td>`;
+  }
+  const maxFit = Math.max(...spots.map(s => Math.abs(s.sg_fit)), 0.01);
+  let rows = '';
+  for (const s of spots) {
+    const tm     = TIER_META[s.tier] || TIER_META[1];
+    const mon    = s.start_date ? new Date(s.start_date + 'T12:00:00').toLocaleString('en-US', {month:'short', day:'numeric'}) : '—';
+    const purse  = s.purse ? `$${(s.purse/1e6).toFixed(1)}M` : '—';
+    const prof   = (s.profile_type || 'balanced').replace(/-/g,' / ');
+    const fit    = s.sg_fit;
+    const barW   = Math.round(Math.min(Math.abs(fit) / maxFit, 1) * 68);
+    const barClr = fit >= 0.5 ? '#4ade80' : fit >= 0 ? '#fbbf24' : '#f87171';
+    const fitStr = (fit >= 0 ? '+' : '') + fit.toFixed(2);
+    rows += `<div class="spot-item" title="${s.event_name}">
+      <span class="spot-name">${s.event_name}</span>
+      <span class="spot-date">${mon}</span>
+      <span class="spot-purse">${purse}</span>
+      <span class="spot-tier"><span class="${tm.cls}">${tm.label}</span></span>
+      <span class="spot-type">${prof}</span>
+      <div class="fit-bar-wrap">
+        <div class="fit-bar" style="width:${barW}px;background:${barClr}"></div>
+        <span style="color:${barClr};font-size:11px;font-weight:700;min-width:32px">${fitStr}</span>
+      </div>
+    </div>`;
+  }
+  return `<td colspan="${colCount}" style="background:#0a1120;padding:0 !important"><div class="spots-detail">
+    <div class="spots-label">Top Upcoming Fits — click row again to collapse</div>
+    ${rows}
+  </div></td>`;
+}
+
+function toggleSpots(id) {
+  const row  = document.getElementById(id);
+  const icon = document.getElementById('icon_' + id);
+  if (!row) return;
+  const isOpen = row.style.display === 'table-row';
+  row.style.display = isOpen ? 'none' : 'table-row';
+  if (icon) icon.classList.toggle('open', !isOpen);
+}
+
 function renderResults(data) {
   let html = '<div class="results-grid">';
   for (const mode of MODES) {
-    const picks = data[mode] || [];
-    const meta  = MODE_META[mode];
-    const isChase = mode === 'chase';
+    const picks    = data[mode] || [];
+    const meta     = MODE_META[mode];
+    const isChase  = mode === 'chase';
+    const colCount = isChase ? 8 : 7;
     html += `
       <div class="mode-block">
         <div class="mode-header ${meta.cls}">
@@ -339,12 +499,31 @@ function renderResults(data) {
           </tr></thead>
           <tbody>`;
     picks.forEach((p, i) => {
-      const star     = p.is_elite ? '<span class="td-star">★</span>' : '';
-      const lev      = p.lev_label;
-      const diffWin  = (p.win_prob * (1 - p.pick_pct/100)).toFixed(1);
-      html += `<tr>
-        <td class="td-rank">${i+1}</td>
-        <td>${star}${p.name}</td>
+      const star    = p.is_elite ? '<span class="td-star">★</span>' : '';
+      const lev     = p.lev_label;
+      const diffWin = (p.win_prob * (1 - p.pick_pct/100)).toFixed(1);
+      const spotId  = `spots_${mode}_${i}`;
+
+      // Initials fallback for headshot
+      const parts    = p.name.split(' ');
+      const initials = parts.length >= 2
+        ? (parts[0][0] + parts[parts.length-1][0]).toUpperCase()
+        : p.name.slice(0,2).toUpperCase();
+
+      const imgHtml = p.headshot_url
+        ? `<img class="headshot" src="${p.headshot_url}" alt=""
+             onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"
+           ><div class="headshot-init" style="display:none">${initials}</div>`
+        : `<div class="headshot-init">${initials}</div>`;
+
+      const formBadge = p.form_label ? `<span class="badge-form" title="Recent form">${p.form_label}</span>` : '';
+      const saveBadge = p.save_event ? `<span class="badge-save" title="Better fit upcoming">⚑ ${p.save_event}</span>` : '';
+      const badges    = (formBadge || saveBadge) ? `<div class="badges">${formBadge}${saveBadge}</div>` : '';
+
+      // Player row — clickable to expand best-fit spots
+      html += `<tr class="player-row" onclick="toggleSpots('${spotId}')">
+        <td class="td-rank"><span class="expand-icon" id="icon_${spotId}">▶</span>${i+1}</td>
+        <td><div class="player-cell">${imgHtml}<div class="player-name-wrap"><span>${star}${p.name}</span>${badges}</div></div></td>
         <td class="td-score">${p.final_score}</td>`;
       if (isChase) {
         html += `<td>${p.win_prob}%</td>
@@ -359,6 +538,11 @@ function renderResults(data) {
                  <td class="lev-${lev}">${lev}</td>`;
       }
       html += `</tr>`;
+
+      // Hidden detail row with best-fit tournament breakdown
+      html += `<tr class="spots-row" id="${spotId}">
+        ${buildSpotsHtml(p.future_spots || [], colCount)}
+      </tr>`;
     });
     html += `</tbody></table></div>`;
   }
@@ -366,9 +550,102 @@ function renderResults(data) {
   document.getElementById('results-content').innerHTML = html;
 }
 
+// ── Weather banner ─────────────────────────────────────────────────────────
+function buildWeatherBanner(weather) {
+  if (!weather || !weather.condition) return;
+  const cond = weather.condition;
+  const icon = WX_ICONS[cond] || '🌤️';
+  const condLabel = {calm:'Calm',windy:'Windy',very_windy:'Very Windy',rainy:'Rainy',storm:'Stormy'}[cond] || cond;
+  const el = document.getElementById('weather-banner');
+  el.className = `weather-banner wx-${cond}`;
+  el.style.display = 'flex';
+  el.innerHTML = `<span class="wx-icon">${icon}</span>
+    <span><b>${condLabel} conditions forecast</b> —
+    ${weather.wind_mph_max}mph wind, ${weather.precip_mm_total}mm rain (4-day avg).
+    ${weather.weather_sg ? 'Use <b>Weather Adj.</b> preset for auto-adjusted SG weights.' : ''}</span>`;
+}
+
+// ── Contest selector ────────────────────────────────────────────────────────
+function buildContestSelector(evContests) {
+  const sel = document.getElementById('contest-select');
+  if (!sel) return;
+  sel.innerHTML = '';
+  for (const key of CONTEST_ORDER) {
+    const opt = document.createElement('option');
+    opt.value = key;
+    opt.textContent = CONTEST_LABELS_JS[key] +
+      (evContests && evContests.includes(key) ? ' ◄ this week' : '');
+    sel.appendChild(opt);
+  }
+}
+
+// ── History ────────────────────────────────────────────────────────────────
+let _historyLoaded = false;
+async function toggleHistory() {
+  const content = document.getElementById('history-content');
+  const arrow   = document.getElementById('history-arrow');
+  const visible = content.style.display !== 'none';
+  if (visible) {
+    content.style.display = 'none';
+    arrow.textContent = '▶';
+    return;
+  }
+  content.style.display = 'block';
+  arrow.textContent = '▼';
+  if (_historyLoaded) return;
+  _historyLoaded = true;
+  try {
+    const resp = await fetch('/history');
+    const data = await resp.json();
+    if (!data.length) {
+      content.innerHTML = '<div class="history-empty">No picks logged yet. Use <code>python3 golf_picks.py --log-result</code> to add entries.</div>';
+      return;
+    }
+    // Sort newest first
+    const rows = [...data].reverse();
+    let html = `<table class="history-table">
+      <thead><tr><th>Date</th><th>Tournament</th><th>Pick</th><th>Finish</th><th>Points</th></tr></thead>
+      <tbody>`;
+    for (const r of rows) {
+      const finNum = parseInt((r.finish || '').replace(/[^0-9]/g,''));
+      let finCls = '';
+      if (r.finish === 'MC' || r.finish === 'WD' || r.finish === 'DQ') finCls = 'finish-mc';
+      else if (finNum && finNum <= 10) finCls = 'finish-good';
+      else if (finNum && finNum <= 25) finCls = 'finish-ok';
+      const pts = r.points ? `$${Number(r.points).toLocaleString()}` : '—';
+      html += `<tr>
+        <td>${r.date || ''}</td>
+        <td>${r.event || ''}</td>
+        <td style="font-weight:600;color:#cbd5e1">${r.pick || ''}</td>
+        <td class="${finCls}">${r.finish || ''}</td>
+        <td>${pts}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    content.innerHTML = html;
+  } catch(e) {
+    content.innerHTML = `<div class="history-empty" style="color:#f87171">Failed to load history: ${e.message}</div>`;
+  }
+}
+
 // ── Init ───────────────────────────────────────────────────────────────────
-buildSgSliders();
-buildModePanels();
+(async function() {
+  try {
+    const resp = await fetch('/baseline.json');
+    if (!resp.ok) throw new Error('baseline fetch failed: ' + resp.status);
+    BASELINE = await resp.json();
+    cur = JSON.parse(JSON.stringify(BASELINE));
+    buildSgSliders();
+    buildModePanels();
+    buildWeatherBanner(BASELINE.weather);
+    buildContestSelector(BASELINE.ev_contests);
+  } catch(e) {
+    document.body.innerHTML = `<div style="color:#f87171;padding:40px;font-family:monospace">
+      <h2>Failed to load baseline data</h2><p>${e.message}</p>
+      <p>Make sure the server is running: <code>python3 golf_picks.py --ui</code></p>
+    </div>`;
+  }
+})();
 </script>
 </body>
 </html>

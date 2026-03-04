@@ -54,8 +54,9 @@ except ImportError:
 BASE_DIR  = Path(__file__).parent
 DATA_DIR  = BASE_DIR / "golf_data"
 CACHE_DIR = DATA_DIR / "cache"
-USED_FILE = DATA_DIR / "used_players.json"
-CFG_FILE  = DATA_DIR / "config.json"
+USED_FILE         = DATA_DIR / "used_players.json"
+CFG_FILE          = DATA_DIR / "config.json"
+PICK_HISTORY_FILE = DATA_DIR / "pick_history.json"
 
 DATA_DIR.mkdir(exist_ok=True)
 CACHE_DIR.mkdir(exist_ok=True)
@@ -107,6 +108,55 @@ CACHE_TTL = {
     "mpsp_standings":   1 * 3600,
     "mpsp_picks":      30 * 60,    # 30 min — refreshes as picks come in
     "mpsp_event_idx":   1 * 3600,
+    "recent_form":      6 * 3600,  # DataGolf trend table
+    "espn_ids":         6 * 3600,  # ESPN player ID → headshot mapping
+    "weather_forecast": 6 * 3600,  # Open-Meteo forecast (no key required)
+}
+
+# ── Course GPS coordinates for weather lookups ────────────────────────────────
+# (latitude, longitude) — used with open-meteo.com free API
+COURSE_LOCATIONS: dict[str, tuple] = {
+    "bay hill":              (28.472,  -81.499),
+    "tpc sawgrass":          (30.200,  -81.397),
+    "pga national":          (26.857,  -80.112),
+    "innisbrook":            (28.141,  -82.734),
+    "tiburon":               (26.140,  -81.793),
+    "torrey pines":          (32.899,  -117.241),
+    "riviera":               (34.048,  -118.518),
+    "pebble beach":          (36.569,  -121.948),
+    "spyglass":              (36.569,  -121.948),
+    "la quinta":             (33.677,  -116.307),
+    "tpc scottsdale":        (33.655,  -111.893),
+    "augusta national":      (33.502,  -82.022),
+    "east lake":             (33.690,  -84.293),
+    "quail hollow":          (35.474,  -80.795),
+    "sedgefield":            (36.054,  -79.867),
+    "muirfield village":     (40.073,  -83.071),
+    "bethpage":              (40.748,  -73.463),
+    "colonial":              (32.738,  -97.350),
+    "tpc craig ranch":       (33.142,  -96.743),
+    "tpc san antonio":       (29.700,  -98.520),
+    "tpc river highlands":   (41.793,  -72.715),
+    "harbour town":          (32.140,  -80.672),
+    "tpc southwind":         (35.042,  -89.773),
+    "castle pines":          (39.438,  -104.888),
+    "kapalua":               (21.000,  -156.667),
+    "waialae":               (21.285,  -157.789),
+    "shadow creek":          (36.250,  -115.189),
+    "tpc summerlin":         (36.182,  -115.319),
+    "congressional":         (39.003,  -77.108),
+    "caves valley":          (39.440,  -76.733),
+    "liberty national":      (40.693,  -74.053),
+    "whistling straits":     (43.860,  -87.737),
+    "erin hills":            (43.252,  -88.330),
+    "medinah":               (41.922,  -87.976),
+    "detroit golf club":     (42.382,  -83.082),
+    "valhalla":              (38.245,  -85.543),
+    "firestone":             (41.082,  -81.530),
+    "oakmont":               (40.527,  -79.829),
+    "winged foot":           (40.972,  -73.760),
+    "pinehurst":             (35.193,  -79.469),
+    "pga west":              (33.677,  -116.307),
 }
 
 # Purse thresholds
@@ -365,6 +415,170 @@ def fetch_field(api_key: str) -> list[dict]:
         if name:
             out.append({"dg_id": dg_id, "name": name})
     return out
+
+def fetch_espn_ids() -> dict:
+    """
+    Fetch ESPN player IDs from the current PGA Tour scoreboard.
+    Returns {normalized_player_name: espn_id_str}.
+    Headshots live at https://a.espncdn.com/i/headshots/golf/players/full/{id}.png
+    """
+    cached = cache_read("espn_ids", CACHE_TTL["espn_ids"])
+    if cached is not None:
+        return cached
+    data = _get(f"{ESPN_BASE}/pga/scoreboard")
+    if not data:
+        return {}
+    result: dict = {}
+    for event in data.get("events", []):
+        for comp in event.get("competitions", []):
+            for c in comp.get("competitors", []):
+                espn_id  = str(c.get("id") or "")
+                athlete  = c.get("athlete") or {}
+                name     = athlete.get("displayName") or athlete.get("fullName") or ""
+                if espn_id and name:
+                    result[_normalize_name(name)] = espn_id
+    if result:
+        cache_write("espn_ids", result)
+    return result
+
+
+def fetch_recent_form() -> dict:
+    """
+    Scrape the DataGolf trend table to get recent-form deltas.
+    Returns {dg_id: {trend, baseline_trend, delta, form_label}}.
+    delta = trend - baseline_trend; positive = hotter than usual, negative = colder.
+    """
+    cached = cache_read("recent_form", CACHE_TTL["recent_form"])
+    if cached is not None:
+        return cached
+    html = _html_get("https://datagolf.com/trend-table")
+    if not html:
+        return {}
+    import json as _json
+    # Data is embedded as: reload_data = JSON.parse('{"df":[...],...}');
+    m = re.search(r"reload_data\s*=\s*JSON\.parse\('(.+?)'\)\s*;", html, re.DOTALL)
+    if not m:
+        print("    [WARN] Could not parse DataGolf trend table")
+        return {}
+    try:
+        json_str = m.group(1).replace("\\'", "'")
+        raw = _json.loads(json_str)
+    except Exception as e:
+        print(f"    [WARN] Trend table JSON parse failed: {e}")
+        return {}
+    # Players live in raw["df"]
+    players = raw.get("df", raw if isinstance(raw, list) else [])
+    result: dict = {}
+    for p in players:
+        dg_id = int(p.get("dg_id") or 0)
+        if not dg_id:
+            continue
+        trend    = float(p.get("trend")          or 0)
+        baseline = float(p.get("baseline_trend") or trend)
+        delta    = trend - baseline
+        if   delta >  0.5: form_label = "🔥"
+        elif delta < -0.5: form_label = "❄️"
+        else:              form_label = ""
+        result[dg_id] = {
+            "trend": trend, "baseline_trend": baseline,
+            "delta": round(delta, 2), "form_label": form_label,
+        }
+    if result:
+        cache_write("recent_form", result)
+    return result
+
+
+def fetch_weather(course_name: str) -> dict:
+    """
+    Fetch 4-day forecast from open-meteo.com (free, no API key required).
+    Returns {wind_mph_max, wind_mph_avg, precip_mm_total, condition}.
+    condition: 'calm' | 'windy' | 'very_windy' | 'rainy' | 'storm'
+    """
+    import urllib.request as _ur
+    import json as _json
+
+    cl = course_name.lower()
+    coords = None
+    for key, (lat, lon) in COURSE_LOCATIONS.items():
+        if key in cl or cl in key:
+            coords = (lat, lon)
+            break
+    if coords is None:
+        matches = difflib.get_close_matches(cl, list(COURSE_LOCATIONS.keys()), n=1, cutoff=0.4)
+        if matches:
+            coords = COURSE_LOCATIONS[matches[0]]
+    if not coords:
+        return {}
+
+    cache_key = f"weather_{cl[:30].replace(' ','_')}"
+    cached = cache_read(cache_key, CACHE_TTL["weather_forecast"])
+    if cached is not None:
+        return cached
+
+    lat, lon = coords
+    url = (f"https://api.open-meteo.com/v1/forecast?"
+           f"latitude={lat}&longitude={lon}"
+           f"&daily=windspeed_10m_max,precipitation_sum"
+           f"&wind_speed_unit=mph&timezone=auto&forecast_days=4")
+    try:
+        with _ur.urlopen(url, timeout=10) as resp:
+            data = _json.loads(resp.read())
+    except Exception as e:
+        print(f"    [WARN] Weather fetch failed: {e}")
+        return {}
+
+    daily        = data.get("daily", {})
+    winds        = [w for w in (daily.get("windspeed_10m_max") or []) if w is not None]
+    precips      = [p for p in (daily.get("precipitation_sum") or []) if p is not None]
+    wind_max     = max(winds[:4])   if winds   else 0.0
+    wind_avg     = sum(winds[:4])   / len(winds[:4]) if winds else 0.0
+    precip_total = sum(precips[:4]) if precips else 0.0
+
+    if   wind_max >= 25 or precip_total >= 10: condition = "storm"
+    elif wind_max >= 20 and precip_total >= 5: condition = "storm"
+    elif wind_max >= 20:                       condition = "very_windy"
+    elif precip_total >= 5:                    condition = "rainy"
+    elif wind_max >= 12:                       condition = "windy"
+    else:                                      condition = "calm"
+
+    result = {
+        "wind_mph_max":    round(wind_max, 1),
+        "wind_mph_avg":    round(wind_avg, 1),
+        "precip_mm_total": round(precip_total, 1),
+        "condition":       condition,
+    }
+    cache_write(cache_key, result)
+    return result
+
+
+def weather_sg_adjustment(base_profile: dict, weather: dict) -> dict:
+    """
+    Adjust SG profile weights based on weather conditions.
+    Wind  → boosts OTT (distance control matters more), reduces putting
+    Rain  → boosts approach (ball-striking in wet conditions), reduces putting
+    Returns a new normalized profile dict; does NOT mutate base_profile.
+    """
+    if not weather:
+        return base_profile
+    p = {k: base_profile.get(k, 0.0) for k in ("sg_ott", "sg_app", "sg_arg", "sg_putt")}
+    wind_max     = weather.get("wind_mph_max",    0)
+    precip_total = weather.get("precip_mm_total", 0)
+
+    if wind_max >= 20:
+        p["sg_ott"] *= 1.12; p["sg_app"] *= 0.94; p["sg_putt"] *= 0.94
+    elif wind_max >= 12:
+        p["sg_ott"] *= 1.06; p["sg_app"] *= 0.97; p["sg_putt"] *= 0.97
+
+    if precip_total >= 5:
+        p["sg_app"] *= 1.08; p["sg_putt"] *= 0.92
+    elif precip_total >= 2:
+        p["sg_app"] *= 1.03; p["sg_putt"] *= 0.97
+
+    total = sum(p.values()) or 1.0
+    normalized = {k: round(v / total, 4) for k, v in p.items()}
+    normalized["type"] = "weather-adjusted"
+    return normalized
+
 
 def fetch_rankings(api_key: str) -> dict:
     """Returns {dg_id: {...stats...}}"""
@@ -1064,6 +1278,51 @@ def cmd_reset():
     else:
         print("  Aborted.")
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PICK HISTORY  (tracks past tournament results for feedback loop)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_pick_history() -> list:
+    """Load pick history. Returns list of {date, event, pick, finish, points}."""
+    if PICK_HISTORY_FILE.exists():
+        try:
+            return json.loads(PICK_HISTORY_FILE.read_text())
+        except Exception:
+            pass
+    return []
+
+
+def append_pick_result(event_name: str, pick_name: str, finish: str, points: float = 0.0):
+    """Append one tournament result to pick_history.json."""
+    history = load_pick_history()
+    history.append({
+        "date":   str(date.today()),
+        "event":  event_name,
+        "pick":   pick_name,
+        "finish": finish,
+        "points": points,
+    })
+    PICK_HISTORY_FILE.write_text(json.dumps(history, indent=2))
+
+
+def cmd_log_result():
+    """Interactive prompt to log a tournament result."""
+    print("\n  ── LOG TOURNAMENT RESULT ─────────────────────────────────────")
+    event  = input("  Tournament name: ").strip()
+    pick   = input("  Player picked:   ").strip()
+    finish = input("  Finish position (e.g. T3, WD, MC): ").strip()
+    pts_s  = input("  Points / earnings (Enter to skip): ").strip()
+    try:
+        pts = float(pts_s.replace(",", "")) if pts_s else 0.0
+    except ValueError:
+        pts = 0.0
+    if event and pick and finish:
+        append_pick_result(event, pick, finish, pts)
+        print(f"  ✓ Logged: {pick} → {finish} at {event}\n")
+    else:
+        print("  Aborted — event, player, and finish are all required.\n")
+
+
 def _normalize_name(name: str) -> str:
     """Normalize 'Last, First' and 'First Last' to the same canonical form."""
     name = name.strip().lower()
@@ -1111,21 +1370,20 @@ def _rank_contention_prob(rank: int) -> float:
     if rank <= 100: return 0.005
     return 0.001
 
-def best_future_spots(stats: dict, rem: list[dict], n: int = 3) -> list[dict]:
+def best_future_spots(stats: dict, rem: list[dict], n: int = 5) -> list[dict]:
     """
-    Return the top N upcoming elite events where this player's SG profile
+    Return the top N upcoming events where this player's SG profile
     best matches the course demands, weighted by event tier/purse.
+    Includes ALL remaining events so the full picture is always visible.
     """
     results = []
     for ev in rem:
-        if ev.get("value_tier", 1) < 3:
-            continue
         course  = ev.get("course", "")
         profile = _course_profile(course)
         sg_fit  = _sg_course_fit(stats, profile)
         tier    = ev.get("value_tier", 1)
         purse   = ev.get("purse", 0)
-        tier_mult = {5: 2.0, 4: 1.5, 3: 1.0}.get(tier, 1.0)
+        tier_mult = {5: 2.0, 4: 1.5, 3: 1.0, 2: 0.75}.get(tier, 0.5)
         combined = sg_fit * tier_mult
         results.append({
             "event_name": ev["event_name"],
@@ -1139,6 +1397,25 @@ def best_future_spots(stats: dict, rem: list[dict], n: int = 3) -> list[dict]:
         })
     results.sort(key=lambda x: x["combined"], reverse=True)
     return results[:n]
+
+def _save_flag(stats: dict, tournament: dict, rem: list) -> str:
+    """
+    Return the name of an upcoming event (within 4 weeks) where this player
+    has a significantly better course-fit AND higher event tier — i.e. they
+    should be saved for that week.  Returns '' if no such event exists.
+    """
+    cur_tier    = tournament.get("value_tier", 2)
+    cur_profile = _course_profile(tournament.get("course", ""))
+    cur_fit     = _sg_course_fit(stats, cur_profile)
+    for ev in rem[:4]:
+        ev_tier    = ev.get("value_tier", 1)
+        ev_profile = _course_profile(ev.get("course", ""))
+        ev_fit     = _sg_course_fit(stats, ev_profile)
+        if ev_tier > cur_tier and ev_fit > cur_fit + 0.25:
+            label = ev.get("event_name", "Upcoming event")
+            return label[:24]
+    return ""
+
 
 def future_value_score(stats: dict, rem: list[dict], cur_tier: int) -> float:
     """
@@ -1240,6 +1517,7 @@ def score_field(
     active_weights: dict = None,
     pick_data:      dict = None,    # {normalized_name: pick_count} — actual MPSP data
     picks_estimated: list = None,   # parallel list of estimated pick pcts (fallback)
+    recent_form:    dict = None,    # {dg_id: {delta, form_label}} from DataGolf trend table
 ) -> list[dict]:
 
     course  = tournament.get("course", "")
@@ -1284,8 +1562,13 @@ def score_field(
         cut_prob  = float(preds.get("make_cut_prob", 65.0))
 
         # ── Component raw scores ─────────────────────────────────────────────
-        # 1. Win + top-10 (weight 3:1 within component)
-        wt_raw = win_prob * 3.0 + top10_prob
+        # 1. Win + top-10 (weight 3:1 within component), modulated by recent form
+        # recent_form keys are strings (JSON), dg_id is int — check both
+        rf        = (recent_form or {}).get(dg_id) or (recent_form or {}).get(str(dg_id), {})
+        delta     = rf.get("delta", 0.0)
+        # Map delta (-2 .. +2 typical) to a ±15% multiplier
+        form_mult = max(0.85, min(1.15, 1.0 + delta * 0.075))
+        wt_raw    = (win_prob * 3.0 + top10_prob) * form_mult
 
         # 2. Course fit + history bonus
         cf_base     = _sg_course_fit(stats, profile)
@@ -1328,6 +1611,9 @@ def score_field(
             "league_pct_burned":  round(la_pct * 100, 1),
             "pick_pct":           0.0,   # filled below
             "pick_pct_source":    "",    # 'actual' | 'estimated'
+            "form_label":     rf.get("form_label", ""),
+            "form_delta":     round(delta, 2),
+            "save_event":     _save_flag(stats, tournament, rem_schedule),
             "_wt_raw":  wt_raw,
             "_cf_raw":  cf_raw,
             "_fv_raw":  fv_raw,
@@ -2142,11 +2428,16 @@ Modes: auto (default) | chase | conservative | balanced
                         help="Custom SG weights, e.g. ott=0.4,app=0.4,arg=0.1,putt=0.1")
     parser.add_argument("--ui",             action="store_true",
                         help="Launch interactive web UI for adjusting weights and running the model")
+    parser.add_argument("--log-result",     action="store_true",
+                        help="Log a tournament pick result to pick history (interactive prompt)")
     args = parser.parse_args()
 
     # ── Simple sub-commands ───────────────────────────────────────────────────
     if args.ui:
         cmd_ui(args)
+        return
+    if args.log_result:
+        cmd_log_result()
         return
     if args.config:
         cmd_config()
@@ -2397,8 +2688,19 @@ _UI_STATE: dict = {}   # shared data between HTTP handler and scoring thread
 
 
 def _ui_score(custom: dict) -> dict:
-    """Re-score the field using custom SG + component weights. Returns top-5 per mode."""
-    s = _UI_STATE
+    """Re-score the field using custom SG + component weights. Returns top-8 per mode."""
+    s           = _UI_STATE
+    espn_ids    = s.get("espn_ids", {})
+    recent_form = s.get("recent_form", {})
+
+    # Contest-specific remaining schedule (#5 — Segment-Specific Mode)
+    contest = custom.get("contest", "year")
+    if contest != "year" and s.get("sched") and s.get("league_cfg"):
+        t_name    = s["tournament"].get("event_name", "")
+        rem_sched = remaining_for_contest(s["sched"], contest, t_name, s["league_cfg"])
+    else:
+        rem_sched = s["rem"]
+
     # Normalize SG weights (user sliders may not sum to 1.0)
     sg_raw   = custom.get("sg", {})
     sg_total = sum(sg_raw.values()) or 1.0
@@ -2413,42 +2715,66 @@ def _ui_score(custom: dict) -> dict:
 
         scored = score_field(
             field=s["field"], rankings=s["rankings"], predictions=s["predictions"],
-            tournament=s["tournament"], rem_schedule=s["rem"],
+            tournament=s["tournament"], rem_schedule=rem_sched,
             course_history=s["course_history"], used_lower=s["used_lower"],
             sg_override=sg_profile, usage_data=s["usage_data"],
             total_members=s["total_members"],
             active_weights=weights,
             pick_data=s["pick_data"] if s["picks_available"] else None,
             picks_estimated=s["est_pcts"],
+            recent_form=recent_form,
         )
-        results[mode_name] = [
-            {
-                "name":        (p["name"].split(",")[1].strip() + " " + p["name"].split(",")[0]).title()
-                               if "," in p["name"] else p["name"].title(),
-                "final_score": round(p["final_score"], 1),
-                "win_prob":    round(p.get("win_prob", 0), 1),
-                "top10_prob":  round(p.get("top10_prob", 0), 1),
-                "pick_pct":    round(p.get("pick_pct", 0), 1),
-                "owgr":        p.get("owgr", 999),
-                "is_elite":    p.get("is_elite", False),
-                "lev_label":   pick_pct_label(p.get("pick_pct", 0)),
-            }
-            for p in scored[:8]
-        ]
+        picks = []
+        for p in scored[:8]:
+            display_name = (
+                (p["name"].split(",")[1].strip() + " " + p["name"].split(",")[0]).title()
+                if "," in p["name"] else p["name"].title()
+            )
+            norm = _normalize_name(display_name)
+            espn_id = espn_ids.get(norm, "")
+            headshot_url = (f"https://a.espncdn.com/i/headshots/golf/players/full/{espn_id}.png"
+                            if espn_id else "")
+            picks.append({
+                "name":         display_name,
+                "final_score":  round(p["final_score"], 1),
+                "win_prob":     round(p.get("win_prob", 0), 1),
+                "top10_prob":   round(p.get("top10_prob", 0), 1),
+                "pick_pct":     round(p.get("pick_pct", 0), 1),
+                "owgr":         p.get("owgr", 999),
+                "is_elite":     p.get("is_elite", False),
+                "lev_label":    pick_pct_label(p.get("pick_pct", 0)),
+                "form_label":   p.get("form_label", ""),
+                "save_event":   p.get("save_event", ""),
+                "headshot_url": headshot_url,
+                "future_spots": p.get("future_spots", []),
+            })
+        results[mode_name] = picks
     return results
 
 
 def _ui_baseline() -> dict:
-    s = _UI_STATE
+    s       = _UI_STATE
     course  = s["tournament"].get("course", "")
     profile = _course_profile(course)
+    weather = s.get("weather", {})
+    weather_profile = s.get("weather_profile", {})
+    sg_base = {k: profile[k] for k in ("sg_ott", "sg_app", "sg_arg", "sg_putt")}
+    sg_weather = (
+        {k: weather_profile.get(k, profile.get(k, 0)) for k in ("sg_ott", "sg_app", "sg_arg", "sg_putt")}
+        if weather_profile and weather_profile.get("type") == "weather-adjusted"
+        else None
+    )
     return {
-        "sg": {k: profile[k] for k in ("sg_ott", "sg_app", "sg_arg", "sg_putt")},
+        "sg": sg_base,
         "weights": {
             "conservative": dict(WEIGHTS_CONSERVATIVE),
             "balanced":     dict(WEIGHTS_BALANCED),
             "chase":        dict(WEIGHTS_CHASE),
         },
+        "weather":         weather,
+        "weather_sg":      sg_weather,
+        "contest_labels":  CONTEST_LABELS,
+        "ev_contests":     s.get("ev_contests", []),
     }
 
 
@@ -2469,12 +2795,12 @@ def _ui_render_html() -> bytes:
 
     purse_m = f"${t.get('purse',0)/1e6:.1f}M" if t.get("purse") else "—"
 
-    import json as _json
-    baseline_js = _json.dumps(baseline)
     profile_type = profile.get("type", "balanced")
 
     html_path = Path(__file__).parent / "golf_picks_ui.html"
-    template  = html_path.read_text() if html_path.exists() else _UI_HTML
+    if not html_path.exists():
+        html_path = Path.home() / "golf_picks_ui.html"
+    template  = html_path.read_text(encoding="utf-8")
 
     return (template
         .replace("__TOURNAMENT_NAME__", t.get("event_name", "Unknown"))
@@ -2483,7 +2809,6 @@ def _ui_render_html() -> bytes:
         .replace("__FIELD_SIZE__",      str(len(s.get("field", []))))
         .replace("__STANDINGS__",       standings_str)
         .replace("__PROFILE_TYPE__",    profile_type)
-        .replace("__BASELINE_JSON__",   baseline_js)
     ).encode()
 
 
@@ -2530,6 +2855,11 @@ def cmd_ui(args):
     ev_contests   = all_contests_for_event(t_name, sched, league_cfg)
     standings_ctx = my_standings_context(standings, my_team, my_owner) if (my_team or my_owner) else {}
     total_members = detect_total_members(standings, usage_data, league_cfg.get("total_members", 0))
+    recent_form   = fetch_recent_form()
+    espn_ids      = fetch_espn_ids()
+    weather       = fetch_weather(tournament.get("course", ""))
+    course_prof   = _course_profile(tournament.get("course", ""))
+    weather_prof  = weather_sg_adjustment(course_prof, weather) if weather else {}
 
     sg_override = SG_FOCUS_PRESETS.get(getattr(args, "focus", None) or "", None)
 
@@ -2540,6 +2870,7 @@ def cmd_ui(args):
         used_lower=used_lower, sg_override=sg_override, usage_data=usage_data,
         total_members=total_members, active_weights=get_weights_for_mode("balanced"),
         pick_data=pick_data if picks_available else None,
+        recent_form=recent_form,
     )
     est_pcts = estimate_pick_pcts(scored_prelim, total_members) if not picks_available else None
 
@@ -2549,7 +2880,10 @@ def cmd_ui(args):
         "used_lower": used_lower, "usage_data": usage_data,
         "total_members": total_members, "pick_data": pick_data,
         "picks_available": picks_available, "est_pcts": est_pcts,
-        "standings_ctx": standings_ctx,
+        "standings_ctx": standings_ctx, "recent_form": recent_form,
+        "espn_ids": espn_ids,
+        "sched": sched, "league_cfg": league_cfg, "ev_contests": ev_contests,
+        "weather": weather, "weather_profile": weather_prof,
     })
 
     # ── HTTP server ───────────────────────────────────────────────────────────
@@ -2561,6 +2895,20 @@ def cmd_ui(args):
                 body = _ui_render_html()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif self.path == "/baseline.json":
+                body = _json.dumps(_ui_baseline()).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif self.path == "/history":
+                body = _json.dumps(load_pick_history()).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -2584,8 +2932,13 @@ def cmd_ui(args):
     PORT   = 5051
     server = HTTPServer(("0.0.0.0", PORT), Handler)   # bind all interfaces (IPv4 + IPv6)
     url    = f"http://127.0.0.1:{PORT}"               # use explicit IP to avoid macOS IPv6 issue
+    wx_cond = weather.get("condition", "")
+    wx_info = (f"  Weather: {wx_cond} ({weather.get('wind_mph_max',0):.0f} mph wind, "
+               f"{weather.get('precip_mm_total',0):.1f}mm rain)") if weather else ""
     print(f"  Web UI ready →  {url}")
     print(f"  Serving {t_name}  |  {total_members} league members")
+    if wx_info:
+        print(wx_info)
     print(f"  Press Ctrl+C to stop.\n")
     threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:
