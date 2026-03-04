@@ -69,29 +69,31 @@ MPSP_BASE = "https://mpsp.protourfantasygolf.com"
 # league_advantage = how rare your access to this player is vs. the league
 
 WEIGHTS_BALANCED = {
-    "win_top10":        0.33,   # Win prob + top-10 probability this week
-    "course_fit":       0.21,   # SG profile vs course demands + history bonus
-    "future_value":     0.20,   # Expected future earnings × event-tier fit
-    "purse_size":       0.07,   # How valuable is this week's purse
-    "league_advantage": 0.10,   # Competitive scarcity: fewer others can use → rare edge
-    "pick_leverage":    0.09,   # Contrarian value: lower pick % = harder to copy = leverage
+    "win_top10":          0.30,   # Win prob + top-10 probability this week
+    "course_fit":         0.20,   # SG profile vs course demands + history bonus
+    "future_value":       0.18,   # Expected future earnings × event-tier fit
+    "purse_size":         0.07,   # How valuable is this week's purse
+    "league_advantage":   0.09,   # Competitive scarcity: fewer others can use → rare edge
+    "pick_leverage":      0.08,   # Contrarian value: lower pick % = harder to copy = leverage
+    "leader_exclusivity": 0.08,   # % of teams ranked ahead who've burned this player
 }
 WEIGHTS_CHASE = {               # Chasing top 10 — differentiate from the pack
-    "win_top10":        0.33,   # Reduced: raw win prob still matters but not everything
-    "course_fit":       0.15,   # Slightly reduced
-    "future_value":     0.09,   # Future value matters less when you need ground now
-    "purse_size":       0.06,
-    "league_advantage": 0.09,
-    "pick_leverage":    0.28,   # Key insight: chalk earners move up WITH the pack — you need to
-                                # differentiate. Low-owned picks with real win prob gain you ground.
+    "win_top10":          0.30,   # Raw win prob still matters
+    "course_fit":         0.13,   # Slightly reduced
+    "future_value":       0.08,   # Future value matters less when you need ground now
+    "purse_size":         0.05,
+    "league_advantage":   0.07,
+    "pick_leverage":      0.17,   # Contrarian picks gain ground vs. pack
+    "leader_exclusivity": 0.20,   # Key: players burned by leaders = exclusive upside for you
 }
 WEIGHTS_CONSERVATIVE = {        # Near top in standings — protect the lead
-    "win_top10":        0.24,
-    "course_fit":       0.23,
-    "future_value":     0.26,
-    "purse_size":       0.07,
-    "league_advantage": 0.12,
-    "pick_leverage":    0.08,   # Reduced: don't need contrarian plays when leading
+    "win_top10":          0.24,
+    "course_fit":         0.22,
+    "future_value":       0.25,
+    "purse_size":         0.07,
+    "league_advantage":   0.11,
+    "pick_leverage":      0.08,   # Reduced: don't need contrarian plays when leading
+    "leader_exclusivity": 0.03,   # Minimal: less important when protecting a lead
 }
 
 # Back-compat alias (used in reasoning generator which doesn't need mode awareness)
@@ -108,6 +110,7 @@ CACHE_TTL = {
     "mpsp_standings":   1 * 3600,
     "mpsp_picks":      30 * 60,    # 30 min — refreshes as picks come in
     "mpsp_event_idx":   1 * 3600,
+    "mpsp_scorecard":  12 * 3600,  # Individual team scorecard (changes weekly)
     "recent_form":      6 * 3600,  # DataGolf trend table
     "espn_ids":         6 * 3600,  # ESPN player ID → headshot mapping
     "weather_forecast": 6 * 3600,  # Open-Meteo forecast (no key required)
@@ -852,6 +855,24 @@ def _parse_standings_rows(html: str) -> list[dict]:
             break
     return entries
 
+def _parse_standings_team_ids(html: str) -> dict:
+    """
+    Scan raw standings HTML and return {rank: team_id} by pairing ordinal rank numbers
+    with scorecard href links in the same <tr> row.
+    Regex approach because _parse_html_table() strips links before we can read them.
+    """
+    rank_map: dict = {}
+    for row_html in re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL | re.IGNORECASE):
+        rank_m = re.search(r'>\s*(\d+)(?:st|nd|rd|th)\s*<', row_html, re.IGNORECASE)
+        id_m   = re.search(r'/scorecard/individual/\d+/\d+/(\d+)', row_html)
+        if rank_m and id_m:
+            try:
+                rank_map[int(rank_m.group(1))] = int(id_m.group(1))
+            except ValueError:
+                pass
+    return rank_map
+
+
 def fetch_mpsp_standings(force: bool = False) -> dict:
     """
     Fetch standings for all contests from MPSP site.
@@ -868,29 +889,41 @@ def fetch_mpsp_standings(force: bool = False) -> dict:
     year = datetime.date.today().year
     result: dict = {}
 
-    # Year-long individual standings
-    html = _html_get(f"{MPSP_BASE}/standings/individual")
-    year_entries = _parse_standings_rows(html) if html else []
-    result["year"] = year_entries
+    def _fetch_and_parse(url: str) -> list[dict]:
+        h = _html_get(url)
+        if not h:
+            return []
+        rows = _parse_standings_rows(h)
+        id_map = _parse_standings_team_ids(h)
+        for entry in rows:
+            entry["team_id"] = id_map.get(entry["rank"], 0)
+        return rows
 
-    # Commissioner's Cup — confirmed URL
-    html = _html_get(f"{MPSP_BASE}/standings/commissioners_cup")
-    result["cup"] = _parse_standings_rows(html) if html else []
+    # Year-long individual standings (always has scorecard links → team IDs)
+    result["year"] = _fetch_and_parse(f"{MPSP_BASE}/standings/individual")
+
+    # Build team-name → team_id lookup from year standings (other pages lack links)
+    name_to_id = {e["team"].lower(): e["team_id"]
+                  for e in result["year"] if e.get("team_id")}
+
+    def _enrich_ids(entries: list[dict]) -> list[dict]:
+        """Back-fill team_id from year standings name lookup for pages without scorecard links."""
+        for e in entries:
+            if not e.get("team_id"):
+                e["team_id"] = name_to_id.get(e.get("team", "").lower(), 0)
+        return entries
+
+    # Commissioner's Cup
+    result["cup"] = _enrich_ids(_fetch_and_parse(f"{MPSP_BASE}/standings/commissioners_cup"))
 
     # Majors — only available after first major (Masters) is played
-    html = _html_get(f"{MPSP_BASE}/standings/majors")
-    majors_entries = _parse_standings_rows(html) if html else []
-    result["majors"] = majors_entries
+    result["majors"] = _enrich_ids(_fetch_and_parse(f"{MPSP_BASE}/standings/majors"))
 
-    # Segment standings — site uses changePeriod(season, period) JS:
-    #   /standings/individual/{year}/{period}/
-    # Segment standings — site JS: changePeriod(season, period) →
-    #   /standings/individual/{year}/{period}/
-    # Period values: 0=Season, 1=Segment 1, 2=Segment 2, 3=Segment 3, 4=Segment 4
-    # Note: early in a segment the data will equal season standings (same events).
+    # Segment standings (period 1-4)
     for seg_num in range(1, 5):
-        html = _html_get(f"{MPSP_BASE}/standings/individual/{year}/{seg_num}/")
-        result[f"seg{seg_num}"] = _parse_standings_rows(html) if html else []
+        result[f"seg{seg_num}"] = _enrich_ids(_fetch_and_parse(
+            f"{MPSP_BASE}/standings/individual/{year}/{seg_num}/"
+        ))
 
     if result.get("year"):
         cache_write("mpsp_standings", result)
@@ -959,6 +992,120 @@ def _get_current_event_index(force: bool = False) -> Optional[int]:
         cache_write("mpsp_event_idx", idx)
         return idx
     return None
+
+def fetch_team_scorecard(team_id: int) -> set:
+    """
+    Fetch a single team's season scorecard and return the set of player name tokens
+    they have already used (burned).  Scorecards use formats like 'Scheffler',
+    'Kim, SW', 'Day, J' — we store both last-name-only and normalized full-name forms
+    so downstream matching is flexible.
+    """
+    cache_key = f"mpsp_scorecard_{team_id}"
+    ttl = CACHE_TTL["mpsp_scorecard"]
+    cached = cache_read(cache_key, ttl)
+    if cached is not None:
+        return set(cached)
+
+    year = date.today().year
+    html = _html_get(f"{MPSP_BASE}/scorecard/individual/{year}/0/{team_id}")
+    if not html:
+        return set()
+
+    burned: set = set()
+    for table_idx in range(6):
+        rows = _parse_html_table(html, table_idx)
+        if not rows:
+            continue
+        found = False
+        for row in rows:
+            if len(row) < 4:
+                continue
+            # First column must be a week number (1-50) to confirm we're in the scorecard table
+            week_str = re.sub(r'[^\d]', '', row[0])
+            if not week_str:
+                continue
+            try:
+                week_num = int(week_str)
+                if not (1 <= week_num <= 50):
+                    continue
+            except ValueError:
+                continue
+            pick = row[3].strip()   # Pick column is index 3
+            if not pick or pick.startswith("--") or pick.lower() in ("pick", "golfer", ""):
+                continue
+            # Store multiple normalized forms to aid matching
+            if "," in pick:
+                last, rest = pick.split(",", 1)
+                rest = rest.strip()
+                burned.add(last.strip().lower())            # last name alone
+                if len(rest) > 2:                          # full name (not initial)
+                    burned.add(_normalize_name(pick))
+            else:
+                burned.add(pick.strip().lower())            # last name (or however listed)
+            found = True
+        if found:
+            break
+
+    cache_write(cache_key, list(burned))
+    return burned
+
+
+def fetch_opponent_inventory(
+    contest_standings: list,
+    my_rank: int,
+    field_last_names: dict,
+) -> tuple:
+    """
+    For all teams ranked ahead of the user in the given contest standings,
+    fetch their season scorecards and count how many have burned each player.
+
+    Args:
+        contest_standings: list of {rank, team, team_id, ...} from fetch_mpsp_standings()
+        my_rank:           user's rank in this contest
+        field_last_names:  {last_name_lower: full_normalized_name} for this week's field
+
+    Returns:
+        ({full_normalized_player_name: count_of_ahead_teams_that_burned_them}, total_ahead)
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    ahead_teams = [
+        e for e in contest_standings
+        if e.get("rank", 999) < my_rank and e.get("team_id", 0)
+    ]
+    if not ahead_teams:
+        return {}, 0
+
+    inventory: dict = {}
+
+    def _fetch(entry):
+        return fetch_team_scorecard(entry["team_id"])
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(_fetch, e): e for e in ahead_teams}
+        for future in as_completed(futures):
+            burned = future.result()
+            for token in burned:
+                # Resolve token → full normalized field-player name
+                matched = field_last_names.get(token)
+                if matched:
+                    inventory[matched] = inventory.get(matched, 0) + 1
+
+    return inventory, len(ahead_teams)
+
+
+def leader_exclusivity_score(player_norm: str, opp_inventory: dict, teams_ahead: int) -> float:
+    """
+    Fraction of teams ranked ahead of the user that have already burned this player.
+    0.0 = no leaders burned them (less exclusive)
+    1.0 = all leaders burned them (maximum exclusive upside — only you can use them)
+    Returns 0.5 (neutral) when no inventory data is available.
+    """
+    if not opp_inventory or teams_ahead <= 0:
+        return 0.5
+    count = opp_inventory.get(player_norm, 0)
+    return count / teams_ahead
+
 
 def estimate_pick_pcts(scored: list[dict], total_members: int) -> dict:
     """
@@ -1518,6 +1665,8 @@ def score_field(
     pick_data:      dict = None,    # {normalized_name: pick_count} — actual MPSP data
     picks_estimated: list = None,   # parallel list of estimated pick pcts (fallback)
     recent_form:    dict = None,    # {dg_id: {delta, form_label}} from DataGolf trend table
+    opp_inventory:  dict = None,    # {norm_player_name: count_ahead_burned} from fetch_opponent_inventory()
+    teams_ahead:    int  = 0,       # total teams ranked ahead of user in active contest
 ) -> list[dict]:
 
     course  = tournament.get("course", "")
@@ -1529,6 +1678,13 @@ def score_field(
     max_purse    = max(all_purses) if all_purses else 1
     max_purse    = max_purse or 1
     purse_norm   = purse / max_purse  # same for every player this week
+
+    # Build last-name → normalized-full-name lookup for opponent inventory matching
+    field_last_names: dict = {}
+    for pl in field:
+        norm = _normalize_name(pl["name"])
+        last = norm.split()[-1]
+        field_last_names.setdefault(last, norm)
 
     candidates = []
 
@@ -1584,7 +1740,11 @@ def score_field(
         # 5. League competitive advantage (how rare is your access to this player?)
         la_raw, la_count, la_pct = _league_advantage(name, usage_data or {}, total_members)
 
-        # 6. Pick leverage (contrarian value — lower weekly pick % = harder to copy)
+        # 6. Leader exclusivity: fraction of teams ranked ahead that have already burned this player.
+        #    High value = most leaders can't pick them anymore = exclusive upside if they win.
+        le_raw = leader_exclusivity_score(norm_name, opp_inventory or {}, teams_ahead)
+
+        # 7. Pick leverage (contrarian value — lower weekly pick % = harder to copy)
         #    pick_data holds actual MPSP pick counts this week; picks_estimated is a
         #    parallel list indexed to the field (resolved in the second pass below).
         #    We store placeholder here; actual value filled after building all candidates.
@@ -1619,7 +1779,9 @@ def score_field(
             "_fv_raw":  fv_raw,
             "_ps_raw":  ps_raw,
             "_la_raw":  la_raw,
+            "_le_raw":  le_raw,
             "_pl_raw":  0.0,    # pick_leverage — filled below
+            "leader_exclusivity_pct": round(le_raw * 100, 1),
             "_field_idx": field_idx,
             "future_spots": best_future_spots(stats, rem_schedule),
         })
@@ -1663,6 +1825,7 @@ def score_field(
     cf_n = _normalize([c["_cf_raw"] for c in candidates])
     fv_n = _normalize([c["_fv_raw"] for c in candidates])
     la_n = _normalize([c["_la_raw"] for c in candidates])
+    le_n = _normalize([c["_le_raw"] for c in candidates])
     pl_n = _normalize([c["_pl_raw"] for c in candidates])
     # Purse is a scalar — convert to 0-100 directly, same for all
     ps_val = purse_norm * 100
@@ -1679,20 +1842,23 @@ def score_field(
         fv = fv_n[i]
         ps = ps_val
         la = la_n[i]
+        le = le_n[i]
         pl = pl_n[i]
 
-        score = (w["win_top10"]        * wt +
-                 w["course_fit"]       * cf +
-                 w["future_value"]     * fv +
-                 w["purse_size"]       * ps +
-                 w["league_advantage"] * la +
-                 w["pick_leverage"]    * pl)
+        score = (w["win_top10"]          * wt +
+                 w["course_fit"]         * cf +
+                 w["future_value"]        * fv +
+                 w["purse_size"]          * ps +
+                 w["league_advantage"]    * la +
+                 w.get("leader_exclusivity", 0) * le +
+                 w["pick_leverage"]       * pl)
 
         c["score_win_top10"]    = round(wt, 1)
         c["score_course_fit"]   = round(cf, 1)
         c["score_future_val"]   = round(fv, 1)
         c["score_purse"]        = round(ps, 1)
         c["score_league_adv"]   = round(la, 1)
+        c["score_leader_excl"]  = round(le, 1)
         c["score_pick_lev"]     = round(pl, 1)
         c["final_score"]        = round(score, 1)
 
@@ -2602,6 +2768,29 @@ Modes: auto (default) | chase | conservative | balanced
     print(f"     Strategy mode: {mode.upper()}  ({mode_src}, contest: {active_contest},"
           f" {total_members} league members)\n")
 
+    # 10b. Opponent inventory — teams ranked ahead of user in active contest
+    my_ctx      = standings_ctx.get(active_contest, {})
+    my_rank_cli = my_ctx.get("rank", 999) if my_ctx else 999
+    contest_standings_list = standings.get(active_contest, [])
+    # Build field last-name map for scorecard matching
+    _field_last_names: dict = {}
+    for _pl in field:
+        _norm = _normalize_name(_pl["name"])
+        _last = _norm.split()[-1]
+        _field_last_names.setdefault(_last, _norm)
+    if contest_standings_list and my_rank_cli < 999:
+        print("  → Building opponent inventory (teams ranked ahead)...")
+        opp_inventory, teams_ahead = fetch_opponent_inventory(
+            contest_standings_list, my_rank_cli, _field_last_names
+        )
+        if teams_ahead:
+            print(f"     {teams_ahead} opponents tracked, "
+                  f"{len(opp_inventory)} players in their inventories")
+        else:
+            print("     No opponent data available (check team name in --league-setup)")
+    else:
+        opp_inventory, teams_ahead = {}, 0
+
     # --show-standings early exit
     if args.show_standings:
         if not standings_ctx:
@@ -2626,6 +2815,8 @@ Modes: auto (default) | chase | conservative | balanced
         total_members=total_members,
         active_weights=get_weights_for_mode("balanced"),
         pick_data=pick_data if picks_available else None,
+        opp_inventory=opp_inventory,
+        teams_ahead=teams_ahead,
     )
     # Estimate pick % from win probs if deadline hasn't passed yet
     if not picks_available and scored_prelim:
@@ -2650,6 +2841,8 @@ Modes: auto (default) | chase | conservative | balanced
             active_weights=get_weights_for_mode(mode_name),
             pick_data=pick_data if picks_available else None,
             picks_estimated=est_pcts,
+            opp_inventory=opp_inventory,
+            teams_ahead=teams_ahead,
         )
     n_scored = len(scored_by_mode.get("balanced", []))
     print(f"     {n_scored} eligible players scored\n")
@@ -2723,6 +2916,8 @@ def _ui_score(custom: dict) -> dict:
             pick_data=s["pick_data"] if s["picks_available"] else None,
             picks_estimated=s["est_pcts"],
             recent_form=recent_form,
+            opp_inventory=s.get("opp_inventory", {}),
+            teams_ahead=s.get("teams_ahead", 0),
         )
         picks = []
         for p in scored[:8]:
@@ -2745,8 +2940,9 @@ def _ui_score(custom: dict) -> dict:
                 "lev_label":    pick_pct_label(p.get("pick_pct", 0)),
                 "form_label":   p.get("form_label", ""),
                 "save_event":   p.get("save_event", ""),
-                "headshot_url": headshot_url,
-                "future_spots": p.get("future_spots", []),
+                "headshot_url":          headshot_url,
+                "future_spots":          p.get("future_spots", []),
+                "leader_exclusivity_pct": p.get("leader_exclusivity_pct", 0),
             })
         results[mode_name] = picks
     return results
@@ -2775,6 +2971,7 @@ def _ui_baseline() -> dict:
         "weather_sg":      sg_weather,
         "contest_labels":  CONTEST_LABELS,
         "ev_contests":     s.get("ev_contests", []),
+        "teams_ahead":     s.get("teams_ahead", 0),
     }
 
 
@@ -2863,6 +3060,33 @@ def cmd_ui(args):
 
     sg_override = SG_FOCUS_PRESETS.get(getattr(args, "focus", None) or "", None)
 
+    # Determine active contest for opponent inventory
+    ui_active_contest = "year"
+    if tournament.get("is_major"):
+        ui_active_contest = "majors"
+    elif any(kw in t_name.lower() for kw in COMMISSIONER_CUP_KEYWORDS):
+        ui_active_contest = "cup"
+    ui_my_ctx    = my_standings_context(standings, my_team, my_owner) if (my_team or my_owner) else {}
+    ui_my_rank   = (ui_my_ctx.get(ui_active_contest) or {}).get("rank", 999)
+    ui_standings = standings.get(ui_active_contest, [])
+
+    # Build field last-name map
+    _ui_field_last_names: dict = {}
+    for _pl in field:
+        _norm = _normalize_name(_pl["name"])
+        _last = _norm.split()[-1]
+        _ui_field_last_names.setdefault(_last, _norm)
+
+    print("  → Building opponent inventory (teams ranked ahead)...")
+    opp_inventory, teams_ahead = fetch_opponent_inventory(
+        ui_standings, ui_my_rank, _ui_field_last_names
+    )
+    if teams_ahead:
+        print(f"     {teams_ahead} opponents tracked, "
+              f"{len(opp_inventory)} players in their inventories")
+    else:
+        print("     No opponent data available (configure team via --league-setup)")
+
     # Prelim score for pick% estimation
     scored_prelim = score_field(
         field=field, rankings=rankings, predictions=predictions,
@@ -2871,6 +3095,7 @@ def cmd_ui(args):
         total_members=total_members, active_weights=get_weights_for_mode("balanced"),
         pick_data=pick_data if picks_available else None,
         recent_form=recent_form,
+        opp_inventory=opp_inventory, teams_ahead=teams_ahead,
     )
     est_pcts = estimate_pick_pcts(scored_prelim, total_members) if not picks_available else None
 
@@ -2884,6 +3109,7 @@ def cmd_ui(args):
         "espn_ids": espn_ids,
         "sched": sched, "league_cfg": league_cfg, "ev_contests": ev_contests,
         "weather": weather, "weather_profile": weather_prof,
+        "opp_inventory": opp_inventory, "teams_ahead": teams_ahead,
     })
 
     # ── HTTP server ───────────────────────────────────────────────────────────

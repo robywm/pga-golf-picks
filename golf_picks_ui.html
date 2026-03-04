@@ -86,6 +86,8 @@ tr:hover td{background:#162032}
 .badges{display:flex;gap:4px;align-items:center;flex-wrap:wrap}
 .badge-form{font-size:13px;line-height:1}
 .badge-save{font-size:10px;font-weight:700;background:#854d0e;color:#fde68a;padding:1px 5px;border-radius:3px;white-space:nowrap}
+.badge-excl{font-size:10px;font-weight:700;background:#14532d;color:#86efac;padding:1px 5px;border-radius:3px;white-space:nowrap}
+.badge-excl-hi{background:#052e16;color:#4ade80}
 
 /* ── Weather ── */
 .weather-banner{font-size:12px;padding:8px 14px;border-radius:6px;margin-bottom:12px;display:flex;align-items:center;gap:10px;font-weight:600}
@@ -240,10 +242,11 @@ const CONTEST_LABELS_JS = {
   seg4:   'Segment 4',
 };
 
-const COMP_KEYS   = ['win_top10','course_fit','future_value','purse_size','league_advantage','pick_leverage'];
+const COMP_KEYS   = ['win_top10','course_fit','future_value','purse_size','league_advantage','pick_leverage','leader_exclusivity'];
 const COMP_LABELS = {
   win_top10:'Win / Top-10',course_fit:'Course Fit',future_value:'Future Value',
-  purse_size:'Purse Size',league_advantage:'League Advantage',pick_leverage:'Pick Leverage'
+  purse_size:'Purse Size',league_advantage:'League Advantage',pick_leverage:'Pick Leverage',
+  leader_exclusivity:'Leader Excl.'
 };
 const COMP_TIPS = {
   win_top10:'Raw win probability + top-10 probability this week',
@@ -251,7 +254,8 @@ const COMP_TIPS = {
   future_value:'Expected future earnings at upcoming elite events',
   purse_size:'How large this week\'s purse is vs season average',
   league_advantage:'How rare your access to this player is (fewer owners = edge)',
-  pick_leverage:'Contrarian value — lower pick% = more ground gained when they score'
+  pick_leverage:'Contrarian value — lower pick% = more ground gained when they score',
+  leader_exclusivity:"% of teams ranked ahead of you that have already burned this player — higher = more exclusive upside when they win"
 };
 const MODES = ['conservative','balanced','chase'];
 const PRESETS = {
@@ -518,7 +522,11 @@ function renderResults(data) {
 
       const formBadge = p.form_label ? `<span class="badge-form" title="Recent form">${p.form_label}</span>` : '';
       const saveBadge = p.save_event ? `<span class="badge-save" title="Better fit upcoming">⚑ ${p.save_event}</span>` : '';
-      const badges    = (formBadge || saveBadge) ? `<div class="badges">${formBadge}${saveBadge}</div>` : '';
+      const exclPct   = p.leader_exclusivity_pct || 0;
+      const exclBadge = exclPct >= 60
+        ? `<span class="badge-excl${exclPct >= 80 ? ' badge-excl-hi' : ''}" title="${exclPct}% of teams ahead have burned this player">🎯 ${Math.round(exclPct)}% excl.</span>`
+        : '';
+      const badges    = (formBadge || saveBadge || exclBadge) ? `<div class="badges">${formBadge}${saveBadge}${exclBadge}</div>` : '';
 
       // Player row — clickable to expand best-fit spots
       html += `<tr class="player-row" onclick="toggleSpots('${spotId}')">
