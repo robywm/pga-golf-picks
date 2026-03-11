@@ -16,17 +16,6 @@ Usage:
 Data sources:
   • DataGolf API  — field, rankings, SG stats, win probabilities, schedule
   • ESPN Golf API — fallback tournament info, supplementary field data
-
-  Contests & strategy:
-  • Tracks 4 season segments, Commissioner's Cup (8 signature events),
-    Majors contest (4 majors), and year-long — each with separate standings
-  • Fetches league-wide golfer usage from mpsp.protourfantasygolf.com so
-    picks account for "competitive availability" (how rare your access is)
-  • Reads your standings in each contest and sets Chase / Conservative /
-    Balanced strategy mode, adjusting scoring weights accordingly
-  • Use --league-setup to configure your team name and segment boundaries
-  • Use --contest to focus analysis on a specific competition
-  • Use --show-standings to see your position in all active contests
 """
 
 import argparse
@@ -36,10 +25,14 @@ import math
 import os
 import re
 import sys
+import threading
 import time
+import webbrowser
 from datetime import date, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 try:
     import requests
@@ -51,115 +44,64 @@ except ImportError:
 # PATHS & CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-BASE_DIR  = Path(__file__).parent
-DATA_DIR  = BASE_DIR / "golf_data"
-CACHE_DIR = DATA_DIR / "cache"
+BASE_DIR          = Path(__file__).parent
+DATA_DIR          = BASE_DIR / "golf_data"
+CACHE_DIR         = DATA_DIR / "cache"
 USED_FILE         = DATA_DIR / "used_players.json"
 CFG_FILE          = DATA_DIR / "config.json"
 PICK_HISTORY_FILE = DATA_DIR / "pick_history.json"
+UI_HTML           = BASE_DIR / "golf_picks_ui.html"
+UI_PORT           = 5051
+MPSP_BASE         = "https://mpsp.protourfantasygolf.com"
 
 DATA_DIR.mkdir(exist_ok=True)
 CACHE_DIR.mkdir(exist_ok=True)
 
 DG_BASE   = "https://feeds.datagolf.com"
 ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/golf"
-MPSP_BASE = "https://mpsp.protourfantasygolf.com"
 
-# ── Scoring weights by strategy mode (each must sum to 1.0) ──────────────────
-# league_advantage = how rare your access to this player is vs. the league
-
-WEIGHTS_BALANCED = {
-    "win_top10":          0.30,   # Win prob + top-10 probability this week
-    "course_fit":         0.20,   # SG profile vs course demands + history bonus
-    "future_value":       0.18,   # Expected future earnings × event-tier fit
-    "purse_size":         0.07,   # How valuable is this week's purse
-    "league_advantage":   0.09,   # Competitive scarcity: fewer others can use → rare edge
-    "pick_leverage":      0.08,   # Contrarian value: lower pick % = harder to copy = leverage
-    "leader_exclusivity": 0.08,   # % of teams ranked ahead who've burned this player
-}
-WEIGHTS_CHASE = {               # Chasing top 10 — differentiate from the pack
-    "win_top10":          0.30,   # Raw win prob still matters
-    "course_fit":         0.13,   # Slightly reduced
-    "future_value":       0.08,   # Future value matters less when you need ground now
-    "purse_size":         0.05,
-    "league_advantage":   0.07,
-    "pick_leverage":      0.17,   # Contrarian picks gain ground vs. pack
-    "leader_exclusivity": 0.20,   # Key: players burned by leaders = exclusive upside for you
-}
-WEIGHTS_CONSERVATIVE = {        # Near top in standings — protect the lead
-    "win_top10":          0.24,
-    "course_fit":         0.22,
-    "future_value":       0.25,
-    "purse_size":         0.07,
-    "league_advantage":   0.11,
-    "pick_leverage":      0.08,   # Reduced: don't need contrarian plays when leading
-    "leader_exclusivity": 0.03,   # Minimal: less important when protecting a lead
+# Scoring weights — must sum to 1.0
+WEIGHTS = {
+    "win_top10":    0.40,   # Win prob + top-10 probability this week
+    "course_fit":   0.25,   # SG profile vs course demands + history bonus
+    "future_value": 0.25,   # Expected future earnings × event-tier fit
+    "purse_size":   0.10,   # How valuable is this week's purse
 }
 
-# Back-compat alias (used in reasoning generator which doesn't need mode awareness)
-WEIGHTS = WEIGHTS_BALANCED
+# Per-mode weights for the web UI (7 components)
+MODE_WEIGHTS = {
+    "conservative": {
+        "win_top10": 0.32, "course_fit": 0.25, "future_value": 0.22,
+        "purse_size": 0.10, "league_advantage": 0.05, "pick_leverage": 0.04,
+        "leader_exclusivity": 0.02,
+    },
+    "balanced": {
+        "win_top10": 0.30, "course_fit": 0.18, "future_value": 0.18,
+        "purse_size": 0.08, "league_advantage": 0.10, "pick_leverage": 0.10,
+        "leader_exclusivity": 0.06,
+    },
+    "chase": {
+        "win_top10": 0.25, "course_fit": 0.12, "future_value": 0.12,
+        "purse_size": 0.05, "league_advantage": 0.14, "pick_leverage": 0.18,
+        "leader_exclusivity": 0.14,
+    },
+}
+
+# Commissioner's Cup event keywords
+CUP_KEYWORDS = [
+    "masters", "u.s. open", "open championship", "pga championship",
+    "the players", "genesis", "arnold palmer", "memorial tournament",
+    "bmw championship", "tour championship", "rbc canadian", "fedex st. jude",
+    "travelers", "wells fargo", "scottish open", "zurich classic",
+]
 
 # Cache TTLs (seconds)
 CACHE_TTL = {
-    "field":            6 * 3600,
-    "rankings":        12 * 3600,
-    "predictions":      6 * 3600,
-    "schedule":        24 * 3600,
-    "history":          7 * 24 * 3600,
-    "mpsp_usage":       4 * 3600,
-    "mpsp_standings":   1 * 3600,
-    "mpsp_picks":      30 * 60,    # 30 min — refreshes as picks come in
-    "mpsp_event_idx":   1 * 3600,
-    "mpsp_scorecard":  12 * 3600,  # Individual team scorecard (changes weekly)
-    "recent_form":      6 * 3600,  # DataGolf trend table
-    "espn_ids":         6 * 3600,  # ESPN player ID → headshot mapping
-    "weather_forecast": 6 * 3600,  # Open-Meteo forecast (no key required)
-}
-
-# ── Course GPS coordinates for weather lookups ────────────────────────────────
-# (latitude, longitude) — used with open-meteo.com free API
-COURSE_LOCATIONS: dict[str, tuple] = {
-    "bay hill":              (28.472,  -81.499),
-    "tpc sawgrass":          (30.200,  -81.397),
-    "pga national":          (26.857,  -80.112),
-    "innisbrook":            (28.141,  -82.734),
-    "tiburon":               (26.140,  -81.793),
-    "torrey pines":          (32.899,  -117.241),
-    "riviera":               (34.048,  -118.518),
-    "pebble beach":          (36.569,  -121.948),
-    "spyglass":              (36.569,  -121.948),
-    "la quinta":             (33.677,  -116.307),
-    "tpc scottsdale":        (33.655,  -111.893),
-    "augusta national":      (33.502,  -82.022),
-    "east lake":             (33.690,  -84.293),
-    "quail hollow":          (35.474,  -80.795),
-    "sedgefield":            (36.054,  -79.867),
-    "muirfield village":     (40.073,  -83.071),
-    "bethpage":              (40.748,  -73.463),
-    "colonial":              (32.738,  -97.350),
-    "tpc craig ranch":       (33.142,  -96.743),
-    "tpc san antonio":       (29.700,  -98.520),
-    "tpc river highlands":   (41.793,  -72.715),
-    "harbour town":          (32.140,  -80.672),
-    "tpc southwind":         (35.042,  -89.773),
-    "castle pines":          (39.438,  -104.888),
-    "kapalua":               (21.000,  -156.667),
-    "waialae":               (21.285,  -157.789),
-    "shadow creek":          (36.250,  -115.189),
-    "tpc summerlin":         (36.182,  -115.319),
-    "congressional":         (39.003,  -77.108),
-    "caves valley":          (39.440,  -76.733),
-    "liberty national":      (40.693,  -74.053),
-    "whistling straits":     (43.860,  -87.737),
-    "erin hills":            (43.252,  -88.330),
-    "medinah":               (41.922,  -87.976),
-    "detroit golf club":     (42.382,  -83.082),
-    "valhalla":              (38.245,  -85.543),
-    "firestone":             (41.082,  -81.530),
-    "oakmont":               (40.527,  -79.829),
-    "winged foot":           (40.972,  -73.760),
-    "pinehurst":             (35.193,  -79.469),
-    "pga west":              (33.677,  -116.307),
+    "field":         6 * 3600,
+    "rankings":     12 * 3600,
+    "predictions":   6 * 3600,
+    "schedule":     24 * 3600,
+    "history":       7 * 24 * 3600,
 }
 
 # Purse thresholds
@@ -172,15 +114,6 @@ ELEVATED_KEYWORDS = MAJOR_KEYWORDS + [
     "the players", "genesis", "arnold palmer", "memorial", "bmw championship",
     "tour championship", "travelers", "wells fargo", "scottish open",
     "fedex st. jude", "rbc canadian", "zurich classic",
-]
-
-WINNER_SHARE = 0.18   # Typical PGA Tour winner's share of purse (for earnings estimates)
-
-# Commissioner's Cup — 8 signature events (partial name match)
-COMMISSIONER_CUP_KEYWORDS = [
-    "pebble beach", "genesis invitational", "arnold palmer invitational",
-    "rbc heritage", "miami championship", "truist championship",
-    "memorial tournament", "travelers championship",
 ]
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -419,170 +352,6 @@ def fetch_field(api_key: str) -> list[dict]:
             out.append({"dg_id": dg_id, "name": name})
     return out
 
-def fetch_espn_ids() -> dict:
-    """
-    Fetch ESPN player IDs from the current PGA Tour scoreboard.
-    Returns {normalized_player_name: espn_id_str}.
-    Headshots live at https://a.espncdn.com/i/headshots/golf/players/full/{id}.png
-    """
-    cached = cache_read("espn_ids", CACHE_TTL["espn_ids"])
-    if cached is not None:
-        return cached
-    data = _get(f"{ESPN_BASE}/pga/scoreboard")
-    if not data:
-        return {}
-    result: dict = {}
-    for event in data.get("events", []):
-        for comp in event.get("competitions", []):
-            for c in comp.get("competitors", []):
-                espn_id  = str(c.get("id") or "")
-                athlete  = c.get("athlete") or {}
-                name     = athlete.get("displayName") or athlete.get("fullName") or ""
-                if espn_id and name:
-                    result[_normalize_name(name)] = espn_id
-    if result:
-        cache_write("espn_ids", result)
-    return result
-
-
-def fetch_recent_form() -> dict:
-    """
-    Scrape the DataGolf trend table to get recent-form deltas.
-    Returns {dg_id: {trend, baseline_trend, delta, form_label}}.
-    delta = trend - baseline_trend; positive = hotter than usual, negative = colder.
-    """
-    cached = cache_read("recent_form", CACHE_TTL["recent_form"])
-    if cached is not None:
-        return cached
-    html = _html_get("https://datagolf.com/trend-table")
-    if not html:
-        return {}
-    import json as _json
-    # Data is embedded as: reload_data = JSON.parse('{"df":[...],...}');
-    m = re.search(r"reload_data\s*=\s*JSON\.parse\('(.+?)'\)\s*;", html, re.DOTALL)
-    if not m:
-        print("    [WARN] Could not parse DataGolf trend table")
-        return {}
-    try:
-        json_str = m.group(1).replace("\\'", "'")
-        raw = _json.loads(json_str)
-    except Exception as e:
-        print(f"    [WARN] Trend table JSON parse failed: {e}")
-        return {}
-    # Players live in raw["df"]
-    players = raw.get("df", raw if isinstance(raw, list) else [])
-    result: dict = {}
-    for p in players:
-        dg_id = int(p.get("dg_id") or 0)
-        if not dg_id:
-            continue
-        trend    = float(p.get("trend")          or 0)
-        baseline = float(p.get("baseline_trend") or trend)
-        delta    = trend - baseline
-        if   delta >  0.5: form_label = "🔥"
-        elif delta < -0.5: form_label = "❄️"
-        else:              form_label = ""
-        result[dg_id] = {
-            "trend": trend, "baseline_trend": baseline,
-            "delta": round(delta, 2), "form_label": form_label,
-        }
-    if result:
-        cache_write("recent_form", result)
-    return result
-
-
-def fetch_weather(course_name: str) -> dict:
-    """
-    Fetch 4-day forecast from open-meteo.com (free, no API key required).
-    Returns {wind_mph_max, wind_mph_avg, precip_mm_total, condition}.
-    condition: 'calm' | 'windy' | 'very_windy' | 'rainy' | 'storm'
-    """
-    import urllib.request as _ur
-    import json as _json
-
-    cl = course_name.lower()
-    coords = None
-    for key, (lat, lon) in COURSE_LOCATIONS.items():
-        if key in cl or cl in key:
-            coords = (lat, lon)
-            break
-    if coords is None:
-        matches = difflib.get_close_matches(cl, list(COURSE_LOCATIONS.keys()), n=1, cutoff=0.4)
-        if matches:
-            coords = COURSE_LOCATIONS[matches[0]]
-    if not coords:
-        return {}
-
-    cache_key = f"weather_{cl[:30].replace(' ','_')}"
-    cached = cache_read(cache_key, CACHE_TTL["weather_forecast"])
-    if cached is not None:
-        return cached
-
-    lat, lon = coords
-    url = (f"https://api.open-meteo.com/v1/forecast?"
-           f"latitude={lat}&longitude={lon}"
-           f"&daily=windspeed_10m_max,precipitation_sum"
-           f"&wind_speed_unit=mph&timezone=auto&forecast_days=4")
-    try:
-        with _ur.urlopen(url, timeout=10) as resp:
-            data = _json.loads(resp.read())
-    except Exception as e:
-        print(f"    [WARN] Weather fetch failed: {e}")
-        return {}
-
-    daily        = data.get("daily", {})
-    winds        = [w for w in (daily.get("windspeed_10m_max") or []) if w is not None]
-    precips      = [p for p in (daily.get("precipitation_sum") or []) if p is not None]
-    wind_max     = max(winds[:4])   if winds   else 0.0
-    wind_avg     = sum(winds[:4])   / len(winds[:4]) if winds else 0.0
-    precip_total = sum(precips[:4]) if precips else 0.0
-
-    if   wind_max >= 25 or precip_total >= 10: condition = "storm"
-    elif wind_max >= 20 and precip_total >= 5: condition = "storm"
-    elif wind_max >= 20:                       condition = "very_windy"
-    elif precip_total >= 5:                    condition = "rainy"
-    elif wind_max >= 12:                       condition = "windy"
-    else:                                      condition = "calm"
-
-    result = {
-        "wind_mph_max":    round(wind_max, 1),
-        "wind_mph_avg":    round(wind_avg, 1),
-        "precip_mm_total": round(precip_total, 1),
-        "condition":       condition,
-    }
-    cache_write(cache_key, result)
-    return result
-
-
-def weather_sg_adjustment(base_profile: dict, weather: dict) -> dict:
-    """
-    Adjust SG profile weights based on weather conditions.
-    Wind  → boosts OTT (distance control matters more), reduces putting
-    Rain  → boosts approach (ball-striking in wet conditions), reduces putting
-    Returns a new normalized profile dict; does NOT mutate base_profile.
-    """
-    if not weather:
-        return base_profile
-    p = {k: base_profile.get(k, 0.0) for k in ("sg_ott", "sg_app", "sg_arg", "sg_putt")}
-    wind_max     = weather.get("wind_mph_max",    0)
-    precip_total = weather.get("precip_mm_total", 0)
-
-    if wind_max >= 20:
-        p["sg_ott"] *= 1.12; p["sg_app"] *= 0.94; p["sg_putt"] *= 0.94
-    elif wind_max >= 12:
-        p["sg_ott"] *= 1.06; p["sg_app"] *= 0.97; p["sg_putt"] *= 0.97
-
-    if precip_total >= 5:
-        p["sg_app"] *= 1.08; p["sg_putt"] *= 0.92
-    elif precip_total >= 2:
-        p["sg_app"] *= 1.03; p["sg_putt"] *= 0.97
-
-    total = sum(p.values()) or 1.0
-    normalized = {k: round(v / total, 4) for k, v in p.items()}
-    normalized["type"] = "weather-adjusted"
-    return normalized
-
-
 def fetch_rankings(api_key: str) -> dict:
     """Returns {dg_id: {...stats...}}"""
     rank_data = dg_get("preds/get-dg-rankings", {}, api_key, "rankings", CACHE_TTL["rankings"])
@@ -640,11 +409,11 @@ def fetch_predictions(api_key: str) -> dict:
         if not dg_id:
             continue
         result[dg_id] = {
-            "win_prob":      float(p.get("win")      or p.get("win_prob")  or 0) * 100,
-            "top5_prob":     float(p.get("top_5")    or p.get("top5")      or 0) * 100,
-            "top10_prob":    float(p.get("top_10")   or p.get("top10")     or 0) * 100,
-            "top20_prob":    float(p.get("top_20")   or p.get("top20")     or 0) * 100,
-            "make_cut_prob": float(p.get("make_cut") or p.get("mc")        or 0.70) * 100,
+            "win_prob":      float(p.get("win")      or p.get("win_prob")  or 0),
+            "top5_prob":     float(p.get("top_5")    or p.get("top5")      or 0),
+            "top10_prob":    float(p.get("top_10")   or p.get("top10")     or 0),
+            "top20_prob":    float(p.get("top_20")   or p.get("top20")     or 0),
+            "make_cut_prob": float(p.get("make_cut") or p.get("mc")        or 70),
         }
     return result
 
@@ -730,601 +499,6 @@ def fetch_espn_field(espn_event_id: str) -> list[dict]:
         if name:
             names.append(name)
     return [{"dg_id": 0, "name": n} for n in names]
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MPSP LEAGUE DATA FETCHERS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _html_get(url: str, timeout: int = 15) -> str:
-    """Fetch URL, return raw HTML string (empty string on failure)."""
-    try:
-        r = requests.get(url, timeout=timeout,
-                         headers={"User-Agent": "Mozilla/5.0 golf-picks-advisor/1.0"})
-        r.raise_for_status()
-        return r.text
-    except Exception as e:
-        print(f"    [WARN] Could not fetch {url}: {e}")
-        return ""
-
-def _strip_html(text: str) -> str:
-    """Remove HTML tags and decode common HTML entities."""
-    text = re.sub(r'<[^>]+>', '', text)
-    for ent, ch in [('&amp;', '&'), ('&lt;', '<'), ('&gt;', '>'),
-                    ('&nbsp;', ' '), ('&#39;', "'"), ('&quot;', '"')]:
-        text = text.replace(ent, ch)
-    return text.strip()
-
-def _parse_html_table(html: str, table_idx: int = 0) -> list[list[str]]:
-    """Parse HTML table by index. Returns rows as lists of cleaned cell strings."""
-    tables = re.findall(r'<table[^>]*>(.*?)</table>', html, re.DOTALL | re.IGNORECASE)
-    if not tables or table_idx >= len(tables):
-        return []
-    rows = re.findall(r'<tr[^>]*>(.*?)</tr>', tables[table_idx], re.DOTALL | re.IGNORECASE)
-    result = []
-    for row_html in rows:
-        cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', row_html, re.DOTALL | re.IGNORECASE)
-        parsed = [_strip_html(c) for c in cells]
-        if any(parsed):
-            result.append(parsed)
-    return result
-
-def fetch_mpsp_golfer_usage(force: bool = False) -> dict:
-    """
-    Scrape league-wide golfer usage counts from MPSP site.
-    Returns {normalized_player_name: usage_count}.
-    """
-    ttl = CACHE_TTL["mpsp_usage"]
-    if not force:
-        cached = cache_read("mpsp_usage", ttl)
-        if cached is not None:
-            return cached
-
-    html = _html_get(f"{MPSP_BASE}/golfers_used_compare/total_golfer_usages")
-    if not html:
-        return cache_read("mpsp_usage", 99_999_999) or {}
-
-    usage = {}
-    for table_idx in range(5):          # Try first 5 tables
-        rows = _parse_html_table(html, table_idx)
-        if not rows:
-            break
-        found = False
-        for row in rows:
-            if len(row) < 2:
-                continue
-            name_raw  = row[0].strip()
-            count_str = re.sub(r'[^\d]', '', row[1])
-            if not count_str or name_raw.lower() in ('golfer', 'player', 'name', ''):
-                continue
-            try:
-                usage[_normalize_name(name_raw)] = int(count_str)
-                found = True
-            except ValueError:
-                pass
-        if found:
-            break
-
-    if usage:
-        cache_write("mpsp_usage", usage)
-    return usage
-
-def _parse_standings_rows(html: str) -> list[dict]:
-    """Parse individual standings table from HTML.
-    Columns expected: Place, PWC, Flag, Team, Owner, Earnings, Earnings Back, ..."""
-    entries = []
-    for table_idx in range(5):
-        rows = _parse_html_table(html, table_idx)
-        if not rows:
-            continue
-        parsed_any = False
-        for row in rows:
-            if len(row) < 5:
-                continue
-            rank_str = re.sub(r'[^\d]', '', row[0])
-            if not rank_str:
-                continue
-            try:
-                rank = int(rank_str)
-            except ValueError:
-                continue
-            team  = row[3] if len(row) > 3 else ""
-            owner = row[4] if len(row) > 4 else ""
-            earnings = 0.0
-            earnings_back = 0.0
-            if len(row) > 5:
-                m = re.search(r'[\d,]+', row[5].replace(',', ''))
-                if m:
-                    try:
-                        earnings = float(m.group())
-                    except ValueError:
-                        pass
-            if len(row) > 6:
-                m = re.search(r'[\d,]+', row[6].replace(',', ''))
-                if m:
-                    try:
-                        earnings_back = float(m.group())
-                    except ValueError:
-                        pass
-            if rank and (team or owner):
-                entries.append({
-                    "rank": rank, "team": team, "owner": owner,
-                    "earnings": earnings, "earnings_back": earnings_back,
-                })
-                parsed_any = True
-        if parsed_any:
-            break
-    return entries
-
-def _parse_standings_team_ids(html: str) -> dict:
-    """
-    Scan raw standings HTML and return {rank: team_id} by pairing ordinal rank numbers
-    with scorecard href links in the same <tr> row.
-    Regex approach because _parse_html_table() strips links before we can read them.
-    """
-    rank_map: dict = {}
-    for row_html in re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL | re.IGNORECASE):
-        rank_m = re.search(r'>\s*(\d+)(?:st|nd|rd|th)\s*<', row_html, re.IGNORECASE)
-        id_m   = re.search(r'/scorecard/individual/\d+/\d+/(\d+)', row_html)
-        if rank_m and id_m:
-            try:
-                rank_map[int(rank_m.group(1))] = int(id_m.group(1))
-            except ValueError:
-                pass
-    return rank_map
-
-
-def fetch_mpsp_standings(force: bool = False) -> dict:
-    """
-    Fetch standings for all contests from MPSP site.
-    Returns {"year": [...], "majors": [...], "cup": [...], "seg1": [...], ...}
-    Each list: [{rank, team, owner, earnings, earnings_back}, ...]
-    """
-    ttl = CACHE_TTL["mpsp_standings"]
-    if not force:
-        cached = cache_read("mpsp_standings", ttl)
-        if cached is not None:
-            return cached
-
-    import datetime
-    year = datetime.date.today().year
-    result: dict = {}
-
-    def _fetch_and_parse(url: str) -> list[dict]:
-        h = _html_get(url)
-        if not h:
-            return []
-        rows = _parse_standings_rows(h)
-        id_map = _parse_standings_team_ids(h)
-        for entry in rows:
-            entry["team_id"] = id_map.get(entry["rank"], 0)
-        return rows
-
-    # Year-long individual standings (always has scorecard links → team IDs)
-    result["year"] = _fetch_and_parse(f"{MPSP_BASE}/standings/individual")
-
-    # Build team-name → team_id lookup from year standings (other pages lack links)
-    name_to_id = {e["team"].lower(): e["team_id"]
-                  for e in result["year"] if e.get("team_id")}
-
-    def _enrich_ids(entries: list[dict]) -> list[dict]:
-        """Back-fill team_id from year standings name lookup for pages without scorecard links."""
-        for e in entries:
-            if not e.get("team_id"):
-                e["team_id"] = name_to_id.get(e.get("team", "").lower(), 0)
-        return entries
-
-    # Commissioner's Cup
-    result["cup"] = _enrich_ids(_fetch_and_parse(f"{MPSP_BASE}/standings/commissioners_cup"))
-
-    # Majors — only available after first major (Masters) is played
-    result["majors"] = _enrich_ids(_fetch_and_parse(f"{MPSP_BASE}/standings/majors"))
-
-    # Segment standings (period 1-4)
-    for seg_num in range(1, 5):
-        result[f"seg{seg_num}"] = _enrich_ids(_fetch_and_parse(
-            f"{MPSP_BASE}/standings/individual/{year}/{seg_num}/"
-        ))
-
-    if result.get("year"):
-        cache_write("mpsp_standings", result)
-    return result
-
-def fetch_mpsp_current_picks(force: bool = False) -> tuple[dict, bool]:
-    """
-    Fetch current week's pick counts from the MPSP Golfers Picked Chart.
-    Returns ({normalized_name: count}, data_available).
-    Data is only available AFTER the weekly lineup deadline.
-    Before deadline this returns ({}, False) — use estimate_pick_pcts() as fallback.
-    """
-    event_idx = _get_current_event_index(force=force)
-    if not event_idx:
-        return {}, False
-
-    cache_key = f"mpsp_picks_{event_idx}"
-    ttl = CACHE_TTL.get("mpsp_picks", 30 * 60)
-    if not force:
-        cached = cache_read(cache_key, ttl)
-        if cached is not None:
-            return cached, bool(cached)
-
-    html = _html_get(f"{MPSP_BASE}/golfers_picked/index/{event_idx}")
-    if not html or "unavailable" in html.lower():
-        return {}, False
-
-    picks: dict = {}
-    for table_idx in range(5):
-        rows = _parse_html_table(html, table_idx)
-        if not rows:
-            continue
-        found = False
-        for row in rows:
-            if len(row) < 2:
-                continue
-            name_raw  = row[0].strip()
-            count_str = re.sub(r'[^\d]', '', row[1])
-            if not count_str or name_raw.lower() in ('golfer', 'player', 'name', ''):
-                continue
-            try:
-                picks[_normalize_name(name_raw)] = int(count_str)
-                found = True
-            except ValueError:
-                pass
-        if found:
-            break
-
-    if picks:
-        cache_write(cache_key, picks)
-    return picks, bool(picks)
-
-def _get_current_event_index(force: bool = False) -> Optional[int]:
-    """Detect the current MPSP event index from the weekly_results page."""
-    if not force:
-        cached = cache_read("mpsp_event_idx", 1 * 3600)
-        if cached is not None:
-            return cached
-
-    html = _html_get(f"{MPSP_BASE}/weekly_results")
-    if not html:
-        return None
-    m = re.search(r'/golfers_picked/index/(\d+)', html)
-    if m:
-        idx = int(m.group(1))
-        cache_write("mpsp_event_idx", idx)
-        return idx
-    return None
-
-def fetch_team_scorecard(team_id: int) -> set:
-    """
-    Fetch a single team's season scorecard and return the set of player name tokens
-    they have already used (burned).  Scorecards use formats like 'Scheffler',
-    'Kim, SW', 'Day, J' — we store both last-name-only and normalized full-name forms
-    so downstream matching is flexible.
-    """
-    cache_key = f"mpsp_scorecard_{team_id}"
-    ttl = CACHE_TTL["mpsp_scorecard"]
-    cached = cache_read(cache_key, ttl)
-    if cached is not None:
-        return set(cached)
-
-    year = date.today().year
-    html = _html_get(f"{MPSP_BASE}/scorecard/individual/{year}/0/{team_id}")
-    if not html:
-        return set()
-
-    burned: set = set()
-    for table_idx in range(6):
-        rows = _parse_html_table(html, table_idx)
-        if not rows:
-            continue
-        found = False
-        for row in rows:
-            if len(row) < 4:
-                continue
-            # First column must be a week number (1-50) to confirm we're in the scorecard table
-            week_str = re.sub(r'[^\d]', '', row[0])
-            if not week_str:
-                continue
-            try:
-                week_num = int(week_str)
-                if not (1 <= week_num <= 50):
-                    continue
-            except ValueError:
-                continue
-            pick = row[3].strip()   # Pick column is index 3
-            if not pick or pick.startswith("--") or pick.lower() in ("pick", "golfer", ""):
-                continue
-            # Store multiple normalized forms to aid matching
-            if "," in pick:
-                last, rest = pick.split(",", 1)
-                rest = rest.strip()
-                burned.add(last.strip().lower())            # last name alone
-                if len(rest) > 2:                          # full name (not initial)
-                    burned.add(_normalize_name(pick))
-            else:
-                burned.add(pick.strip().lower())            # last name (or however listed)
-            found = True
-        if found:
-            break
-
-    cache_write(cache_key, list(burned))
-    return burned
-
-
-def fetch_opponent_inventory(
-    contest_standings: list,
-    my_rank: int,
-    field_last_names: dict,
-) -> tuple:
-    """
-    For all teams ranked ahead of the user in the given contest standings,
-    fetch their season scorecards and count how many have burned each player.
-
-    Args:
-        contest_standings: list of {rank, team, team_id, ...} from fetch_mpsp_standings()
-        my_rank:           user's rank in this contest
-        field_last_names:  {last_name_lower: full_normalized_name} for this week's field
-
-    Returns:
-        ({full_normalized_player_name: count_of_ahead_teams_that_burned_them}, total_ahead)
-    """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    ahead_teams = [
-        e for e in contest_standings
-        if e.get("rank", 999) < my_rank and e.get("team_id", 0)
-    ]
-    if not ahead_teams:
-        return {}, 0
-
-    inventory: dict = {}
-
-    def _fetch(entry):
-        return fetch_team_scorecard(entry["team_id"])
-
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(_fetch, e): e for e in ahead_teams}
-        for future in as_completed(futures):
-            burned = future.result()
-            for token in burned:
-                # Resolve token → full normalized field-player name
-                matched = field_last_names.get(token)
-                if matched:
-                    inventory[matched] = inventory.get(matched, 0) + 1
-
-    return inventory, len(ahead_teams)
-
-
-def leader_exclusivity_score(player_norm: str, opp_inventory: dict, teams_ahead: int) -> float:
-    """
-    Fraction of teams ranked ahead of the user that have already burned this player.
-    0.0 = no leaders burned them (less exclusive)
-    1.0 = all leaders burned them (maximum exclusive upside — only you can use them)
-    Returns 0.5 (neutral) when no inventory data is available.
-    """
-    if not opp_inventory or teams_ahead <= 0:
-        return 0.5
-    count = opp_inventory.get(player_norm, 0)
-    return count / teams_ahead
-
-
-def estimate_pick_pcts(scored: list[dict], total_members: int) -> dict:
-    """
-    Estimate weekly pick percentages based on win probability distribution.
-    Used as fallback when actual pick data isn't yet available (pre-deadline).
-    Returns {player_name: pick_pct} so lookup is by name, not position.
-
-    Logic: in one-and-done leagues, picks concentrate heavily on the top 10-15
-    players. We model this by:
-      1. Only distributing among players with win_prob >= 1% (realistic contenders)
-      2. Using exponent=2.5 so picks skew sharply toward high-probability players
-      3. Players below threshold get a flat ~0.5% residual estimate
-    This produces realistic ownership: top favorite ~25-40%, second ~15-25%, etc.
-    """
-    if not scored:
-        return {}
-    WIN_THRESHOLD = 1.0   # only realistic picks among players with >=1% win prob
-    EXPONENT      = 2.5   # steep concentration toward favorites
-    RESIDUAL_PCT  = 0.5   # flat estimate for long-shots below threshold
-
-    result: dict = {}
-    contenders = [p for p in scored if p.get("win_prob", 0) >= WIN_THRESHOLD]
-    tail       = [p for p in scored if p.get("win_prob", 0) <  WIN_THRESHOLD]
-
-    # Assign residual to long-shots first, then distribute remainder to contenders
-    tail_total = len(tail) * RESIDUAL_PCT
-    for p in tail:
-        result[p["name"]] = RESIDUAL_PCT
-
-    remaining_pct = max(100.0 - tail_total, 10.0)
-    if contenders:
-        raw   = [p.get("win_prob", 0) ** EXPONENT for p in contenders]
-        total = sum(raw) or 1.0
-        for p, r in zip(contenders, raw):
-            result[p["name"]] = round(r / total * remaining_pct, 1)
-    return result
-
-def pick_pct_label(pct: float) -> str:
-    """Return a human-readable label for a pick percentage."""
-    if pct >= 25:   return "CHALK"
-    if pct >= 12:   return "popular"
-    if pct >= 4:    return "moderate"
-    if pct >= 1.5:  return "low"
-    return "contrarian"
-
-TOP10_GOAL = 10   # Target finish position for all contests
-
-def my_standings_context(standings: dict, my_team: str, my_owner: str = "") -> dict:
-    """
-    Find the user's position in each contest.
-    Matches on team name OR owner name (case-insensitive substring).
-    Returns {contest: {rank, total, earnings, earnings_back, mode, pct_rank,
-                       top10_earnings, gap_to_top10, in_top10}}.
-    mode is calibrated to a TOP-10 finish goal:
-      'conservative' = already in top 10 (protect position)
-      'balanced'     = just outside top 10 (#11-20), within striking distance
-      'chase'        = rank 21+ (need to climb meaningfully to reach top 10)
-    """
-    if not my_team and not my_owner:
-        return {}
-    needles = [s.lower() for s in [my_team, my_owner] if s]
-    context: dict = {}
-    for contest, entries in standings.items():
-        if not entries:
-            continue
-        total = len(entries)
-        my_entry = None
-        for e in entries:
-            team_l  = e["team"].lower()
-            owner_l = e["owner"].lower()
-            if any(n in team_l or n in owner_l for n in needles):
-                my_entry = e
-                break
-        if not my_entry:
-            continue
-        rank     = my_entry["rank"]
-        pct_rank = rank / total if total else 0.5
-        # Find the #10 player's earnings (top-10 boundary)
-        sorted_entries = sorted(entries, key=lambda e: e["rank"])
-        top10_entry    = sorted_entries[TOP10_GOAL - 1] if len(sorted_entries) >= TOP10_GOAL else sorted_entries[-1]
-        top10_earnings = top10_entry["earnings"]
-        gap_to_top10   = max(top10_earnings - my_entry["earnings"], 0)
-        in_top10       = rank <= TOP10_GOAL
-        # Mode based on distance from top-10 goal
-        if in_top10:
-            mode = "conservative"
-        elif rank <= 20:
-            mode = "balanced"
-        else:
-            mode = "chase"
-        context[contest] = {
-            "rank":           rank,
-            "total":          total,
-            "earnings":       my_entry["earnings"],
-            "earnings_back":  my_entry["earnings_back"],
-            "mode":           mode,
-            "pct_rank":       round(pct_rank, 2),
-            "top10_earnings": top10_earnings,
-            "gap_to_top10":   gap_to_top10,
-            "in_top10":       in_top10,
-        }
-    return context
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CONTEST LOGIC
-# ══════════════════════════════════════════════════════════════════════════════
-
-def load_league_cfg() -> dict:
-    """Load league config section from config.json."""
-    return load_cfg().get("league", {})
-
-def save_league_cfg(league: dict):
-    cfg = load_cfg()
-    cfg["league"] = league
-    save_cfg(cfg)
-
-def cmd_setup_league():
-    """Interactive league configuration wizard."""
-    league = load_league_cfg()
-    print("\n  ── LEAGUE SETUP ──────────────────────────────────────────────")
-    cur_team = league.get("my_team", "")
-    print(f"  Current team name: {cur_team or '(not set)'}")
-    new_team = input("  Your team name (Enter to keep): ").strip()
-    if new_team:
-        league["my_team"] = new_team
-
-    cur_owner = league.get("my_owner", "")
-    print(f"  Current owner name (as shown on MPSP): {cur_owner or '(not set)'}")
-    new_owner = input("  Your owner name (Enter to keep): ").strip()
-    if new_owner:
-        league["my_owner"] = new_owner
-
-    cur_members = league.get("total_members", 0)
-    print(f"\n  Current total league members: {cur_members or '(auto-detect from standings)'}")
-    nm = input("  Total league members (Enter to auto-detect): ").strip()
-    if nm.isdigit():
-        league["total_members"] = int(nm)
-
-    print("\n  Configure 4 season segments (enter start and end event names).")
-    print("  Example: 'Sony Open in Hawaii'  or  'Arnold Palmer Invitational'")
-    segments = league.get("segments", [])
-    new_segs = []
-    for i in range(1, 5):
-        cur = segments[i - 1] if i <= len(segments) else {}
-        print(f"\n  Segment {i}:")
-        cur_start = cur.get("start_event", "")
-        cur_end   = cur.get("end_event",   "")
-        start = input(f"    Start event [{cur_start or 'not set'}]: ").strip() or cur_start
-        end   = input(f"    End event   [{cur_end   or 'not set'}]: ").strip() or cur_end
-        new_segs.append({"name": f"Segment {i}", "start_event": start, "end_event": end})
-    league["segments"] = new_segs
-    save_league_cfg(league)
-    print("\n  League configuration saved.\n")
-
-def _events_in_segment(sched: list[dict], seg: dict) -> list[str]:
-    """Return event names that fall within a segment (start → end, inclusive)."""
-    start_kw = seg.get("start_event", "").lower().strip()
-    end_kw   = seg.get("end_event",   "").lower().strip()
-    if not start_kw or not end_kw:
-        return []
-    in_seg, names = False, []
-    for ev in sched:
-        nl = ev.get("event_name", "").lower()
-        if not in_seg:
-            if start_kw in nl or nl in start_kw:
-                in_seg = True
-        if in_seg:
-            names.append(ev.get("event_name", ""))
-            if end_kw in nl or nl in end_kw:
-                break
-    return names
-
-def all_contests_for_event(event_name: str, sched: list[dict], league_cfg: dict) -> list[str]:
-    """Return every contest label that the given event counts toward."""
-    nl = event_name.lower()
-    contests = ["year"]
-    if any(kw in nl for kw in COMMISSIONER_CUP_KEYWORDS):
-        contests.append("cup")
-    if any(kw in nl for kw in MAJOR_KEYWORDS):
-        contests.append("majors")
-    for i, seg in enumerate(league_cfg.get("segments", []), 1):
-        seg_names_lower = [n.lower() for n in _events_in_segment(sched, seg)]
-        if any(nl in sn or sn in nl for sn in seg_names_lower):
-            contests.append(f"seg{i}")
-    return list(dict.fromkeys(contests))
-
-def remaining_for_contest(
-    sched: list[dict], contest: str, current_name: str, league_cfg: dict
-) -> list[dict]:
-    """Return future schedule events (after today) that count toward `contest`."""
-    today = date.today()
-    result = []
-    for ev in sched:
-        try:
-            start = date.fromisoformat(ev["start_date"])
-        except (ValueError, TypeError):
-            continue
-        if start <= today or ev.get("event_name", "") == current_name:
-            continue
-        if contest in all_contests_for_event(ev["event_name"], sched, league_cfg):
-            result.append(ev)
-    return result
-
-def get_weights_for_mode(mode: str) -> dict:
-    """Return scoring weight dict for the given strategy mode."""
-    return {"chase": WEIGHTS_CHASE, "conservative": WEIGHTS_CONSERVATIVE}.get(mode, WEIGHTS_BALANCED)
-
-def detect_total_members(standings: dict, usage_data: dict, cfg_members: int) -> int:
-    """Best estimate of total league members for burn-rate calculations."""
-    if cfg_members > 0:
-        return cfg_members
-    # Approximate from year-long standings count
-    year_entries = standings.get("year", [])
-    if year_entries:
-        return max(e["rank"] for e in year_entries)
-    # Fall back to max usage seen (top used player ≈ total)
-    if usage_data:
-        return max(usage_data.values())
-    return 100  # last resort default
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TOURNAMENT DETECTION
@@ -1425,51 +599,6 @@ def cmd_reset():
     else:
         print("  Aborted.")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PICK HISTORY  (tracks past tournament results for feedback loop)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def load_pick_history() -> list:
-    """Load pick history. Returns list of {date, event, pick, finish, points}."""
-    if PICK_HISTORY_FILE.exists():
-        try:
-            return json.loads(PICK_HISTORY_FILE.read_text())
-        except Exception:
-            pass
-    return []
-
-
-def append_pick_result(event_name: str, pick_name: str, finish: str, points: float = 0.0):
-    """Append one tournament result to pick_history.json."""
-    history = load_pick_history()
-    history.append({
-        "date":   str(date.today()),
-        "event":  event_name,
-        "pick":   pick_name,
-        "finish": finish,
-        "points": points,
-    })
-    PICK_HISTORY_FILE.write_text(json.dumps(history, indent=2))
-
-
-def cmd_log_result():
-    """Interactive prompt to log a tournament result."""
-    print("\n  ── LOG TOURNAMENT RESULT ─────────────────────────────────────")
-    event  = input("  Tournament name: ").strip()
-    pick   = input("  Player picked:   ").strip()
-    finish = input("  Finish position (e.g. T3, WD, MC): ").strip()
-    pts_s  = input("  Points / earnings (Enter to skip): ").strip()
-    try:
-        pts = float(pts_s.replace(",", "")) if pts_s else 0.0
-    except ValueError:
-        pts = 0.0
-    if event and pick and finish:
-        append_pick_result(event, pick, finish, pts)
-        print(f"  ✓ Logged: {pick} → {finish} at {event}\n")
-    else:
-        print("  Aborted — event, player, and finish are all required.\n")
-
-
 def _normalize_name(name: str) -> str:
     """Normalize 'Last, First' and 'First Last' to the same canonical form."""
     name = name.strip().lower()
@@ -1517,20 +646,21 @@ def _rank_contention_prob(rank: int) -> float:
     if rank <= 100: return 0.005
     return 0.001
 
-def best_future_spots(stats: dict, rem: list[dict], n: int = 5) -> list[dict]:
+def best_future_spots(stats: dict, rem: list[dict], n: int = 3) -> list[dict]:
     """
-    Return the top N upcoming events where this player's SG profile
+    Return the top N upcoming elite events where this player's SG profile
     best matches the course demands, weighted by event tier/purse.
-    Includes ALL remaining events so the full picture is always visible.
     """
     results = []
     for ev in rem:
+        if ev.get("value_tier", 1) < 3:
+            continue
         course  = ev.get("course", "")
         profile = _course_profile(course)
         sg_fit  = _sg_course_fit(stats, profile)
         tier    = ev.get("value_tier", 1)
         purse   = ev.get("purse", 0)
-        tier_mult = {5: 2.0, 4: 1.5, 3: 1.0, 2: 0.75}.get(tier, 0.5)
+        tier_mult = {5: 2.0, 4: 1.5, 3: 1.0}.get(tier, 1.0)
         combined = sg_fit * tier_mult
         results.append({
             "event_name": ev["event_name"],
@@ -1544,25 +674,6 @@ def best_future_spots(stats: dict, rem: list[dict], n: int = 5) -> list[dict]:
         })
     results.sort(key=lambda x: x["combined"], reverse=True)
     return results[:n]
-
-def _save_flag(stats: dict, tournament: dict, rem: list) -> str:
-    """
-    Return the name of an upcoming event (within 4 weeks) where this player
-    has a significantly better course-fit AND higher event tier — i.e. they
-    should be saved for that week.  Returns '' if no such event exists.
-    """
-    cur_tier    = tournament.get("value_tier", 2)
-    cur_profile = _course_profile(tournament.get("course", ""))
-    cur_fit     = _sg_course_fit(stats, cur_profile)
-    for ev in rem[:4]:
-        ev_tier    = ev.get("value_tier", 1)
-        ev_profile = _course_profile(ev.get("course", ""))
-        ev_fit     = _sg_course_fit(stats, ev_profile)
-        if ev_tier > cur_tier and ev_fit > cur_fit + 0.25:
-            label = ev.get("event_name", "Upcoming event")
-            return label[:24]
-    return ""
-
 
 def future_value_score(stats: dict, rem: list[dict], cur_tier: int) -> float:
     """
@@ -1616,40 +727,6 @@ def _history_bonus(name: str, course_history: dict) -> tuple[float, str]:
 # MAIN SCORING ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _league_advantage(name: str, usage_data: dict, total_members: int) -> tuple[float, int, float]:
-    """
-    Competitive scarcity score for a player.
-    Returns (raw_score 0–1, usage_count, pct_burned).
-
-    raw_score = pct of league that has already used this player.
-    High pct_burned → you have rare access (most opponents can't pick them) → competitive edge.
-    Low pct_burned  → most opponents still have them → no scarcity advantage.
-    """
-    if not usage_data or total_members <= 0:
-        return 0.5, 0, 0.5   # Unknown — neutral
-    norm = _normalize_name(name)          # e.g. "rory mcilroy"
-    last = norm.split()[-1] if norm else norm   # e.g. "mcilroy"
-    usage_count = 0
-    # 1. Exact full-name match
-    if norm in usage_data:
-        usage_count = usage_data[norm]
-    else:
-        # 2. Last-name match: MPSP often stores just last name ("mcilroy")
-        #    or last-name with first initial ("b koepka"). Both share last token.
-        for league_name, count in usage_data.items():
-            league_last = league_name.split()[-1] if league_name else ""
-            if last == league_last:
-                usage_count = count
-                break
-        # 3. Fuzzy fallback for edge cases
-        if not usage_count:
-            for league_name, count in usage_data.items():
-                if difflib.SequenceMatcher(None, norm, league_name).ratio() > 0.78:
-                    usage_count = count
-                    break
-    pct = min(usage_count / total_members, 1.0)
-    return pct, usage_count, pct
-
 def score_field(
     field:          list[dict],
     rankings:       dict,
@@ -1659,14 +736,6 @@ def score_field(
     course_history: dict,
     used_lower:     set,
     sg_override:    dict = None,
-    usage_data:     dict = None,
-    total_members:  int  = 0,
-    active_weights: dict = None,
-    pick_data:      dict = None,    # {normalized_name: pick_count} — actual MPSP data
-    picks_estimated: list = None,   # parallel list of estimated pick pcts (fallback)
-    recent_form:    dict = None,    # {dg_id: {delta, form_label}} from DataGolf trend table
-    opp_inventory:  dict = None,    # {norm_player_name: count_ahead_burned} from fetch_opponent_inventory()
-    teams_ahead:    int  = 0,       # total teams ranked ahead of user in active contest
 ) -> list[dict]:
 
     course  = tournament.get("course", "")
@@ -1678,13 +747,6 @@ def score_field(
     max_purse    = max(all_purses) if all_purses else 1
     max_purse    = max_purse or 1
     purse_norm   = purse / max_purse  # same for every player this week
-
-    # Build last-name → normalized-full-name lookup for opponent inventory matching
-    field_last_names: dict = {}
-    for pl in field:
-        norm = _normalize_name(pl["name"])
-        last = norm.split()[-1]
-        field_last_names.setdefault(last, norm)
 
     candidates = []
 
@@ -1718,13 +780,8 @@ def score_field(
         cut_prob  = float(preds.get("make_cut_prob", 65.0))
 
         # ── Component raw scores ─────────────────────────────────────────────
-        # 1. Win + top-10 (weight 3:1 within component), modulated by recent form
-        # recent_form keys are strings (JSON), dg_id is int — check both
-        rf        = (recent_form or {}).get(dg_id) or (recent_form or {}).get(str(dg_id), {})
-        delta     = rf.get("delta", 0.0)
-        # Map delta (-2 .. +2 typical) to a ±15% multiplier
-        form_mult = max(0.85, min(1.15, 1.0 + delta * 0.075))
-        wt_raw    = (win_prob * 3.0 + top10_prob) * form_mult
+        # 1. Win + top-10 (weight 3:1 within component)
+        wt_raw = win_prob * 3.0 + top10_prob
 
         # 2. Course fit + history bonus
         cf_base     = _sg_course_fit(stats, profile)
@@ -1737,86 +794,32 @@ def score_field(
         # 4. Purse (same for everyone)
         ps_raw = purse_norm
 
-        # 5. League competitive advantage (how rare is your access to this player?)
-        la_raw, la_count, la_pct = _league_advantage(name, usage_data or {}, total_members)
-
-        # 6. Leader exclusivity: fraction of teams ranked ahead that have already burned this player.
-        #    High value = most leaders can't pick them anymore = exclusive upside if they win.
-        le_raw = leader_exclusivity_score(norm_name, opp_inventory or {}, teams_ahead)
-
-        # 7. Pick leverage (contrarian value — lower weekly pick % = harder to copy)
-        #    pick_data holds actual MPSP pick counts this week; picks_estimated is a
-        #    parallel list indexed to the field (resolved in the second pass below).
-        #    We store placeholder here; actual value filled after building all candidates.
-        field_idx = len(candidates)   # index into picks_estimated
-
         is_elite = owgr <= ELITE_RANK_CUTOFF
 
         candidates.append({
-            "dg_id":          dg_id,
-            "name":           name,
-            "owgr":           owgr,
-            "dg_rank":        dg_rank,
-            "sg_total":       float(stats.get("sg_total", 0)),
-            "sg_ott":         float(stats.get("sg_ott",   0)),
-            "sg_app":         float(stats.get("sg_app",   0)),
-            "sg_arg":         float(stats.get("sg_arg",   0)),
-            "sg_putt":        float(stats.get("sg_putt",  0)),
-            "win_prob":       win_prob,
-            "top10_prob":     top10_prob,
-            "make_cut_prob":  cut_prob,
+            "dg_id":         dg_id,
+            "name":          name,
+            "owgr":          owgr,
+            "dg_rank":       dg_rank,
+            "sg_total":      float(stats.get("sg_total", 0)),
+            "sg_ott":        float(stats.get("sg_ott",   0)),
+            "sg_app":        float(stats.get("sg_app",   0)),
+            "sg_arg":        float(stats.get("sg_arg",   0)),
+            "sg_putt":       float(stats.get("sg_putt",  0)),
+            "win_prob":      win_prob,
+            "top10_prob":    top10_prob,
+            "make_cut_prob": cut_prob,
             "course_history": hist_summary,
-            "is_elite":       is_elite,
-            "league_usage":       la_count,
-            "league_pct_burned":  round(la_pct * 100, 1),
-            "pick_pct":           0.0,   # filled below
-            "pick_pct_source":    "",    # 'actual' | 'estimated'
-            "form_label":     rf.get("form_label", ""),
-            "form_delta":     round(delta, 2),
-            "save_event":     _save_flag(stats, tournament, rem_schedule),
+            "is_elite":      is_elite,
             "_wt_raw":  wt_raw,
             "_cf_raw":  cf_raw,
             "_fv_raw":  fv_raw,
             "_ps_raw":  ps_raw,
-            "_la_raw":  la_raw,
-            "_le_raw":  le_raw,
-            "_pl_raw":  0.0,    # pick_leverage — filled below
-            "leader_exclusivity_pct": round(le_raw * 100, 1),
-            "_field_idx": field_idx,
             "future_spots": best_future_spots(stats, rem_schedule),
         })
 
     if not candidates:
         return []
-
-    # ── Resolve pick_pct for each candidate ──────────────────────────────────
-    # Use actual MPSP data if available, else fall back to estimation.
-    total_pick_count = sum((pick_data or {}).values()) or total_members or len(candidates)
-    if total_pick_count <= 0:
-        total_pick_count = len(candidates)
-
-    for c in candidates:
-        if pick_data:
-            # Actual post-deadline pick counts
-            norm = _normalize_name(c["name"])
-            count = 0
-            for lname, cnt in (pick_data or {}).items():
-                if difflib.SequenceMatcher(None, norm, lname).ratio() > 0.78:
-                    count = cnt
-                    break
-            pct  = count / total_pick_count * 100
-            src  = "actual"
-        elif picks_estimated and c["name"] in picks_estimated:
-            pct = picks_estimated[c["name"]]
-            src = "est."
-        else:
-            pct = 1.0
-            src = "est."
-        c["pick_pct"]        = round(pct, 1)
-        c["pick_pct_source"] = src
-        # pick_leverage_raw: 1 - (pick_pct/100), clamped to [0,1]
-        # Low pick % → high raw score → high leverage
-        c["_pl_raw"] = max(0.0, 1.0 - pct / 100.0)
 
     # ── Normalize each component across the field ────────────────────────────
     n = len(candidates)
@@ -1824,14 +827,8 @@ def score_field(
     wt_n = _normalize([c["_wt_raw"] for c in candidates])
     cf_n = _normalize([c["_cf_raw"] for c in candidates])
     fv_n = _normalize([c["_fv_raw"] for c in candidates])
-    la_n = _normalize([c["_la_raw"] for c in candidates])
-    le_n = _normalize([c["_le_raw"] for c in candidates])
-    pl_n = _normalize([c["_pl_raw"] for c in candidates])
     # Purse is a scalar — convert to 0-100 directly, same for all
     ps_val = purse_norm * 100
-
-    # Use mode-specific weights if provided, else balanced defaults
-    w = active_weights if active_weights else WEIGHTS_BALANCED
 
     # Future elite events still available
     elite_remaining = [e for e in rem_schedule if e.get("value_tier", 1) >= 4]
@@ -1841,26 +838,17 @@ def score_field(
         cf = cf_n[i]
         fv = fv_n[i]
         ps = ps_val
-        la = la_n[i]
-        le = le_n[i]
-        pl = pl_n[i]
 
-        score = (w["win_top10"]          * wt +
-                 w["course_fit"]         * cf +
-                 w["future_value"]        * fv +
-                 w["purse_size"]          * ps +
-                 w["league_advantage"]    * la +
-                 w.get("leader_exclusivity", 0) * le +
-                 w["pick_leverage"]       * pl)
+        score = (WEIGHTS["win_top10"]    * wt +
+                 WEIGHTS["course_fit"]   * cf +
+                 WEIGHTS["future_value"] * fv +
+                 WEIGHTS["purse_size"]   * ps)
 
-        c["score_win_top10"]    = round(wt, 1)
-        c["score_course_fit"]   = round(cf, 1)
-        c["score_future_val"]   = round(fv, 1)
-        c["score_purse"]        = round(ps, 1)
-        c["score_league_adv"]   = round(la, 1)
-        c["score_leader_excl"]  = round(le, 1)
-        c["score_pick_lev"]     = round(pl, 1)
-        c["final_score"]        = round(score, 1)
+        c["score_win_top10"]   = round(wt, 1)
+        c["score_course_fit"]  = round(cf, 1)
+        c["score_future_val"]  = round(fv, 1)
+        c["score_purse"]       = round(ps, 1)
+        c["final_score"]       = round(score, 1)
 
         # "Save for later" flag: elite player, significant future opportunity,
         # current event is not major/elevated
@@ -2041,30 +1029,6 @@ def _print_summary(picks: list[dict], tournament: dict, rem: list[dict]):
         print(f"\n  VALUE PLAYS:  {val_names}")
         print(f"  {_wrap('Lower-ranked players with a strong course fit this week. Good options if you are saving your elite picks for later in the season.', 74, '  ')}")
 
-    # ── Pick ownership / leverage ─────────────────────────────────────────────
-    chalk   = [p for p in picks if p.get("pick_pct", 0) >= 20]
-    leverage = [p for p in picks if p.get("pick_pct", 0) < 5 and p["win_prob"] >= 4]
-    src = picks[0].get("pick_pct_source", "est.") if picks else "est."
-    src_note = "(actual MPSP picks)" if src == "actual" else "(estimated pre-deadline)"
-
-    if chalk:
-        chalk_names = ", ".join(
-            p["name"].split(",")[0].title() if "," in p["name"] else p["name"].split()[-1]
-            for p in chalk[:4]
-        )
-        chalk_pcts = " / ".join(f"{p['pick_pct']:.0f}%" for p in chalk[:4])
-        print(f"\n  CHALK {src_note}: {chalk_names}  [{chalk_pcts}]")
-        print(f"  {_wrap('High pick% players — everyone else is riding them too. Picking chalk keeps you safe when they score, but you gain zero ground when they succeed.', 74, '  ')}")
-
-    if leverage:
-        lev_names = ", ".join(
-            p["name"].split(",")[0].title() if "," in p["name"] else p["name"].split()[-1]
-            for p in leverage[:3]
-        )
-        lev_pcts = " / ".join(f"{p['pick_pct']:.0f}%" for p in leverage[:3])
-        print(f"\n  HIGH LEVERAGE {src_note}: {lev_names}  [{lev_pcts}]")
-        print(f"  {_wrap('Low pick% players with meaningful win probability. If they score well you gain on almost everyone in the field — maximum differentiation.', 74, '  ')}")
-
     # ── Major awareness ───────────────────────────────────────────────────────
     if next_major:
         weeks_away = (date.fromisoformat(next_major["start_date"]) - date.today()).days // 7
@@ -2094,240 +1058,8 @@ def _wrap(text: str, width: int, indent: str) -> str:
         lines.append(" ".join(line))
     return f"\n{indent}".join(lines)
 
-CONTEST_LABELS = {
-    "year":   "Year-Long",
-    "majors": "Majors",
-    "cup":    "Commissioner's Cup",
-    "seg1":   "Segment 1",
-    "seg2":   "Segment 2",
-    "seg3":   "Segment 3",
-    "seg4":   "Segment 4",
-}
-
-def _print_contest_context(
-    standings_ctx:  dict,
-    ev_contests:    list[str],
-    active_contest: str,
-    mode:           str,
-):
-    """Print league standings (top-10 goal framing) and strategy mode."""
-    if not standings_ctx:
-        return
-    W = 78
-    print(f"\n  LEAGUE STANDINGS  (goal: top {TOP10_GOAL} finish in each contest)")
-    print("─" * W)
-    mode_tags = {
-        "chase":        "⚡ CHASE",
-        "conservative": "🛡 CONSERVATIVE",
-        "balanced":     "⚖ BALANCED",
-    }
-    for contest, ctx in standings_ctx.items():
-        label    = CONTEST_LABELS.get(contest, contest.upper())
-        in_ev    = "  ◄ THIS WEEK COUNTS" if contest in ev_contests else ""
-        rank     = ctx["rank"]
-        total    = ctx["total"]
-        earn     = ctx["earnings"]
-        g10      = ctx.get("gap_to_top10", 0)
-        in_top10 = ctx.get("in_top10", False)
-        m_tag    = mode_tags.get(ctx["mode"], "")
-        active_m = " ← FOCUS" if contest == active_contest else ""
-        if in_top10:
-            gap_str = f"  (✓ IN TOP {TOP10_GOAL}!)"
-        else:
-            gap_str = f"  (${g10:>10,.0f} to top {TOP10_GOAL})"
-        print(f"  {label:<24} #{rank:>3}/{total:<3}  ${earn:>12,.0f}{gap_str}  {m_tag}{active_m}{in_ev}")
-
-    mode_hints = {
-        "chase":        f"outside top {TOP10_GOAL} — use CHASE (high win-prob, contrarian picks to gain ground)",
-        "conservative": f"IN top {TOP10_GOAL} — use CONSERVATIVE (protect position, prioritize future value)",
-        "balanced":     f"close to top {TOP10_GOAL} — use BALANCED (push without overreaching)",
-    }
-    print(f"\n  Suggested for [{CONTEST_LABELS.get(active_contest, active_contest)}]: "
-          f"{mode_hints.get(mode, mode)}")
-
-
-def _contest_remaining_events(
-    contest: str, sched: list[dict], tournament: dict, league_cfg: dict
-) -> list[dict]:
-    """Return events counting toward `contest` from now on, INCLUDING the current week."""
-    t_name = tournament.get("event_name", "")
-    today  = date.today()
-    result = []
-    for ev in sched:
-        try:
-            start = date.fromisoformat(ev["start_date"])
-        except (ValueError, TypeError):
-            continue
-        is_current = ev.get("event_name", "") == t_name
-        is_future  = start > today
-        if not (is_current or is_future):
-            continue
-        if contest in all_contests_for_event(ev["event_name"], sched, league_cfg):
-            result.append(ev)
-    return result
-
-
-def _wrap(text: str, width: int = 76, indent: str = "  ") -> str:
-    """Simple word-wrap helper."""
-    words, lines, line = text.split(), [], indent
-    for w in words:
-        if len(line) + len(w) + 1 > width:
-            lines.append(line)
-            line = indent + w
-        else:
-            line += (" " if line != indent else "") + w
-    if line.strip():
-        lines.append(line)
-    return "\n".join(lines)
-
-
-def _print_contest_decision(
-    standings_ctx: dict,
-    ev_contests:   list[str],
-    sched:         list[dict],
-    tournament:    dict,
-    league_cfg:    dict,
-):
-    """
-    Compare contests the current event counts toward and recommend which to prioritize.
-    Shows remaining events, theoretical max earnings, gap closeability, and a verdict.
-    """
-    # Only compare if we have standings for ≥2 relevant contests
-    compare = [c for c in ev_contests if c in standings_ctx]
-    if len(compare) < 2:
-        return
-
-    W = 78
-    print(f"\n  CONTEST DECISION ANALYSIS")
-    print("─" * W)
-
-    rows = []
-    for contest in compare:
-        ctx   = standings_ctx[contest]
-        label = CONTEST_LABELS.get(contest, contest.upper())
-        rem_evs  = _contest_remaining_events(contest, sched, tournament, league_cfg)
-        n_total  = len(rem_evs)
-        n_future = n_total - 1
-        max_rem  = sum(ev.get("purse", 0) * WINNER_SHARE for ev in rem_evs)
-        max_week = max((ev.get("purse", 0) * WINNER_SHARE for ev in rem_evs), default=0)
-        g10      = ctx.get("gap_to_top10", ctx["earnings_back"])
-        in_top10 = ctx.get("in_top10", False)
-        rows.append({
-            "contest":   contest,
-            "label":     label,
-            "rank":      ctx["rank"],
-            "total":     ctx["total"],
-            "pct_rank":  ctx["pct_rank"],
-            "g10":       g10,
-            "in_top10":  in_top10,
-            "n_total":   n_total,
-            "n_future":  n_future,
-            "max_rem":   max_rem,
-            "max_week":  max_week,
-            "top10_closeable": in_top10 or max_rem >= g10,
-            "last_event": n_future == 0,
-        })
-
-    # ── Print summary rows ────────────────────────────────────────────────────
-    for r in rows:
-        status  = "⚠ LAST EVENT THIS WEEK" if r["last_event"] else f"{r['n_future']} events after this"
-        if r["in_top10"]:
-            gap_s = f"  ✓ IN TOP {TOP10_GOAL}!        "
-            close = "maintain position"
-        else:
-            gap_s = f"  ${r['g10']:>10,.0f} to top {TOP10_GOAL}"
-            close = "✓ top-10 reachable" if r["top10_closeable"] else "✗ top-10 out of reach"
-        print(f"  {r['label']:<24} #{r['rank']:>3}/{r['total']:<3}  {gap_s}  {status}")
-        print(f"  {'':24}  Max remaining: ${r['max_rem']:>10,.0f}  [{close}]")
-        print()
-
-    # ── Verdict ───────────────────────────────────────────────────────────────
-    seg_rows = [r for r in rows if r["contest"].startswith("seg")]
-    cup_rows = [r for r in rows if r["contest"] == "cup"]
-
-    if not seg_rows or not cup_rows:
-        return  # can't compare if we don't have both
-
-    seg = seg_rows[0]
-    cup = cup_rows[0]
-
-    seg_final        = seg["last_event"]
-    seg_top10_reach  = seg["top10_closeable"]
-    cup_top10_reach  = cup["top10_closeable"]
-    seg_in_top10     = seg["in_top10"]
-    cup_in_top10     = cup["in_top10"]
-
-    if seg_in_top10 and cup_in_top10:
-        verdict = "BOTH — protect all top-10 positions"
-        detail  = (
-            f"You're in the top {TOP10_GOAL} in both contests. Play conservatively — "
-            f"prioritize high-floor picks (strong top-10 probability) and protect your spots."
-        )
-    elif seg_in_top10 and not cup_in_top10:
-        verdict = "CUP — climb into top 10"
-        detail  = (
-            f"You're already in the top {TOP10_GOAL} in {seg['label']} — protect it with "
-            f"a conservative pick. But the bigger opportunity is Commissioner's Cup "
-            f"(#{cup['rank']}/{cup['total']}, ${cup['g10']:,.0f} gap) where you have "
-            f"{cup['n_future']} events of runway to crack the top {TOP10_GOAL}."
-        )
-    elif cup_in_top10 and not seg_in_top10:
-        verdict = f"SEG — climb into top 10 in {seg['label']}"
-        detail  = (
-            f"You're already in the top {TOP10_GOAL} in Commissioner's Cup — protect it. "
-            f"Focus this week on {seg['label']} (#{seg['rank']}/{seg['total']}, "
-            f"${seg['g10']:,.0f} gap to top {TOP10_GOAL})."
-        )
-    elif seg_final and not seg_top10_reach and cup_top10_reach:
-        verdict = "CUP — top-10 is the goal, Segment 1 is out of reach"
-        detail  = (
-            f"{seg['label']} ends THIS WEEK and a top-{TOP10_GOAL} finish is out of reach "
-            f"(${seg['g10']:,.0f} gap, max this event ~${seg['max_week']:,.0f}). "
-            f"Commissioner's Cup is the right target: #{cup['rank']}/{cup['total']}, "
-            f"${cup['g10']:,.0f} to top {TOP10_GOAL} with {cup['n_future']} events remaining."
-        )
-    elif seg_final and seg_top10_reach:
-        verdict = "EITHER — top-10 push works for both"
-        detail  = (
-            f"{seg['label']} ends THIS WEEK but a top-{TOP10_GOAL} finish is still possible "
-            f"(${seg['g10']:,.0f} gap vs ~${seg['max_week']:,.0f} max). "
-            f"An aggressive pick that earns big this week also boosts your Commissioner's Cup "
-            f"position (#{cup['rank']}/{cup['total']}, {cup['n_future']} events left). "
-            f"Target maximum win probability."
-        )
-    elif not seg_top10_reach and cup_top10_reach:
-        verdict = "CUP — only top-10 path still open"
-        detail  = (
-            f"Top-{TOP10_GOAL} in {seg['label']} is out of reach "
-            f"(${seg['g10']:,.0f} gap, only ${seg['max_rem']:,.0f} max remaining). "
-            f"Commissioner's Cup is your best top-{TOP10_GOAL} opportunity: "
-            f"#{cup['rank']}/{cup['total']} with ${cup['g10']:,.0f} to close over "
-            f"{cup['n_future']} events."
-        )
-    elif cup["rank"] < seg["rank"] and cup_top10_reach:
-        verdict = "CUP — better positioned for top 10"
-        detail  = (
-            f"Closer to top {TOP10_GOAL} in Commissioner's Cup (#{cup['rank']}, "
-            f"${cup['g10']:,.0f} gap) than {seg['label']} (#{seg['rank']}, "
-            f"${seg['g10']:,.0f} gap), and the cup has {cup['n_future']} events of runway."
-        )
-    else:
-        verdict = "BOTH — both top-10 paths are open"
-        detail  = (
-            f"Top-{TOP10_GOAL} is reachable in both contests. "
-            f"Play the model's recommended pick — it optimizes for both simultaneously."
-        )
-
-    print(f"  VERDICT: {verdict}")
-    print(_wrap(detail))
-    print()
-
-
-def print_report(tournament: dict, scored_by_mode: dict,
-                 used_count: int, rem: list[dict], sg_profile: dict = None,
-                 standings_ctx: dict = None, ev_contests: list[str] = None,
-                 active_contest: str = "year", auto_mode: str = "balanced",
-                 sched: list = None, league_cfg: dict = None):
+def print_report(tournament: dict, picks: list[dict],
+                 used_count: int, rem: list[dict], sg_profile: dict = None):
     W   = 78
     DIV = "═" * W
     DIV2= "─" * W
@@ -2353,9 +1085,6 @@ def print_report(tournament: dict, scored_by_mode: dict,
     print(f"  {'Event Tier':<12}: {TIER_LABELS.get(tier, 'Standard')} (Tier {tier}/5)"
           + ("  ◄ MAJOR" if is_major else ""))
     print(f"  {'Used':<12}: {used_count} player(s) burned this season")
-    if ev_contests:
-        contest_str = "  •  ".join(CONTEST_LABELS.get(c, c) for c in ev_contests)
-        print(f"  {'Contests':<12}: {contest_str}")
 
     if sg_profile:
         focus_type = sg_profile.get("type", "custom")
@@ -2374,97 +1103,32 @@ def print_report(tournament: dict, scored_by_mode: dict,
             p_m  = f"${ev.get('purse', 0)/1e6:.1f}M"
             print(f"    • {ev['event_name']:<42} {ev['start_date']}  {p_m:>7}  [{tl}]")
 
-    _print_contest_context(
-        standings_ctx or {}, ev_contests or [], active_contest, auto_mode
-    )
-    if sched and league_cfg:
-        _print_contest_decision(
-            standings_ctx or {}, ev_contests or [], sched, tournament, league_cfg
-        )
+    print(f"\n{DIV}")
+    print(f"  TOP 10 RECOMMENDED PICKS  (score = 0–100)")
+    print(DIV)
 
-    # ── Three mode tables ─────────────────────────────────────────────────────
-    MODE_META = {
-        "conservative": ("🛡  CONSERVATIVE", f"in top {TOP10_GOAL} — protect position, favor floor & future value"),
-        "balanced":     ("⚖  BALANCED",      f"just outside top {TOP10_GOAL} — steady push without overreaching"),
-        "chase":        ("🔥 CHASE",          f"chasing top {TOP10_GOAL} — differentiate from the pack; chalk moves everyone up together"),
-    }
-    any_picks = any(scored_by_mode.get(m) for m in MODE_META)
-    if not any_picks:
+    if not picks:
         print("\n  No eligible picks found. Check your API key, cache, or used-player list.")
         print(DIV + "\n")
         return
 
-    for mode_name in ["conservative", "balanced", "chase"]:
-        mode_picks = scored_by_mode.get(mode_name, [])
-        if not mode_picks:
-            continue
-        label, desc = MODE_META[mode_name]
-        suggested = "  ◄ SUGGESTED" if mode_name == auto_mode else ""
-        print(f"\n{DIV}")
-        print(f"  {label}  ({desc}){suggested}")
-        print(DIV)
-        src_note = "actual" if mode_picks[0].get("pick_pct_source") == "actual" else "est."
-        is_chase = mode_name == "chase"
-        if is_chase:
-            print(f"\n  {'#':<4} {'Player':<26} {'Score':>6}  {'Win%':>5}  {'Top10%':>6}  "
-                  f"{'Pick%(' + src_note + ')':>12}  {'DiffWin%':>8}  {'Leverage'}")
-            print(f"  {'-'*4} {'-'*26} {'-'*6}  {'-'*5}  {'-'*6}  {'-'*12}  {'-'*8}  {'-'*10}")
-        else:
-            print(f"\n  {'#':<4} {'Player':<26} {'Score':>6}  {'OWGR':>5}  {'Top10%':>6}  "
-                  f"{'Pick%(' + src_note + ')':>12}  {'Leverage'}")
-            print(f"  {'-'*4} {'-'*26} {'-'*6}  {'-'*5}  {'-'*6}  {'-'*12}  {'-'*10}")
-        for rank, p in enumerate(mode_picks[:5], 1):
-            elite = "★" if p["is_elite"] else " "
-            name  = (p["name"].title() if "," not in p["name"]
-                     else f"{p['name'].split(',')[1].strip()} {p['name'].split(',')[0].strip()}".title())
-            pct     = p.get("pick_pct", 0.0)
-            win_p   = p.get("win_prob", 0.0)
-            diff_win = win_p * (1.0 - pct / 100.0)
-            if is_chase:
-                print(f"  {rank:<4} {elite}{name:<25} {p['final_score']:>6.1f}  "
-                      f"{win_p:>4.1f}%  {p['top10_prob']:>5.1f}%  "
-                      f"{pct:>10.1f}%  {diff_win:>7.1f}%  {pick_pct_label(pct)}")
-            else:
-                print(f"  {rank:<4} {elite}{name:<25} {p['final_score']:>6.1f}  "
-                      f"#{p['owgr']:<4}  {p['top10_prob']:>5.1f}%  "
-                      f"{pct:>10.1f}%  {pick_pct_label(pct)}")
+    # ── Quick-reference table ─────────────────────────────────────────────────
+    print(f"\n  {'#':<4} {'Player':<26} {'Score':>6}  {'OWGR':>5}  {'Top10%':>6}  {'Best Future Spots'}")
+    print(f"  {'-'*4} {'-'*26} {'-'*6}  {'-'*5}  {'-'*6}  {'-'*34}")
+    for rank, p in enumerate(picks[:10], 1):
+        elite = "★" if p["is_elite"] else " "
+        name  = p["name"].title() if "," not in p["name"] else f"{p['name'].split(',')[1].strip()} {p['name'].split(',')[0].strip()}".title()
+        spots = p.get("future_spots", [])
+        spot_str = "  •  ".join(
+            _short_name(s["event_name"]) for s in spots[:2]
+        ) if spots else "—"
+        print(f"  {rank:<4} {elite}{name:<25} {p['final_score']:>6.1f}  #{p['owgr']:<4}  {p['top10_prob']:>5.1f}%  {spot_str}")
+    print()
 
-    # Chase-specific note explaining DiffWin%
-    if auto_mode == "chase" or "chase" in scored_by_mode:
-        chase_picks = scored_by_mode.get("chase", [])[:5]
-        if chase_picks:
-            print(f"\n  DiffWin% = Win% × (1 − Pick%) — your exclusive upside when chasing.")
-            print(f"  Chalk moves everyone up together; high DiffWin% = you gain ground on the pack.")
-
-    # ── Build union of top-5 candidates, sorted by balanced score ─────────────
-    seen_names: set = set()
-    all_candidates: list = []
-    for mode_name in ["conservative", "balanced", "chase"]:
-        for p in scored_by_mode.get(mode_name, [])[:5]:
-            if p["name"] not in seen_names:
-                seen_names.add(p["name"])
-                all_candidates.append(p)
-    balanced_rank = {p["name"]: p["final_score"] for p in scored_by_mode.get("balanced", [])}
-    all_candidates.sort(key=lambda p: balanced_rank.get(p["name"], 0), reverse=True)
-
-    def _mode_tags(name: str) -> str:
-        parts = []
-        for mn, short in [("conservative", "CON"), ("balanced", "BAL"), ("chase", "CHZ")]:
-            for r, p in enumerate(scored_by_mode.get(mn, [])[:5], 1):
-                if p["name"] == name:
-                    parts.append(f"{short}#{r}")
-                    break
-        return "  [" + " · ".join(parts) + "]" if parts else ""
-
-    print(f"\n{DIV}")
-    print(f"  PLAYER PROFILES  ({len(all_candidates)} candidates across all modes)")
-    print(DIV)
-
-    for p in all_candidates:
-        mode_tag = _mode_tags(p["name"])
-        flag     = "  ⚠  SAVE FOR LATER" if p.get("save_for_later") else ""
-        elite    = "★ " if p["is_elite"] else "  "
-        print(f"\n  {elite}{p['name'].upper()}{mode_tag}{flag}")
+    for rank, p in enumerate(picks[:10], 1):
+        flag   = "  ⚠  SAVE FOR LATER" if p.get("save_for_later") else ""
+        elite  = "★ " if p["is_elite"] else "  "
+        print(f"\n  #{rank}  {elite}{p['name'].upper()}{flag}")
         print(DIV2)
 
         # Score bar
@@ -2476,29 +1140,7 @@ def print_report(tournament: dict, scored_by_mode: dict,
         print(f"  Components →  Win/Top10: {p['score_win_top10']:5.1f}  "
               f"Course Fit: {p['score_course_fit']:5.1f}  "
               f"Future Val: {p['score_future_val']:5.1f}  "
-              f"Purse: {p['score_purse']:5.1f}  "
-              f"Lg Adv: {p.get('score_league_adv', 0):5.1f}  "
-              f"Pick Lev: {p.get('score_pick_lev', 0):5.1f}")
-
-        # Pick ownership line
-        pct     = p.get("pick_pct", 0.0)
-        src     = p.get("pick_pct_source", "est.")
-        lv_lbl  = pick_pct_label(pct)
-        lv_flag = ""
-        if pct >= 25:
-            lv_flag = "  ⚠ CHALK — picking with the crowd limits your upside"
-        elif pct < 4 and p["win_prob"] >= 5:
-            lv_flag = "  ★ HIGH LEVERAGE — strong player, almost nobody taking him"
-        print(f"  Pick Ownership: {pct:>5.1f}%  [{lv_lbl}]  ({src}){lv_flag}")
-
-        # League usage context
-        lg_used  = p.get("league_usage", 0)
-        lg_pct   = p.get("league_pct_burned", 0)
-        lg_avail = round(100 - lg_pct, 1)
-        lg_note  = (f"  [{lg_used} members used ({lg_pct:.0f}% burned) — "
-                    f"{lg_avail:.0f}% of league still has them]"
-                    if lg_used > 0 else "  [no league usage data]")
-        print(f"  League Access:{lg_note}")
+              f"Purse: {p['score_purse']:5.1f}")
 
         # Key metrics
         print(f"  OWGR #{p['owgr']:<5}  DG #{p['dg_rank']:<5}  "
@@ -2540,8 +1182,471 @@ def print_report(tournament: dict, scored_by_mode: dict,
             print(f"  WHY NOW : {wrapped}")
 
     print(f"\n{DIV}")
-    _print_summary(all_candidates, tournament, rem)
+    _print_summary(picks[:10], tournament, rem)
     print(f"{DIV}\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WEB UI  (python golf_picks.py --ui)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_pick_history() -> list:
+    if PICK_HISTORY_FILE.exists():
+        try:
+            return json.loads(PICK_HISTORY_FILE.read_text())
+        except Exception:
+            pass
+    return []
+
+
+def fetch_mpsp_usage(total_members: int = 20) -> dict:
+    """Fetch season-long player usage rates from MPSP public page."""
+    try:
+        r = requests.get(
+            f"{MPSP_BASE}/golfers_used_compare/total_golfer_usages",
+            timeout=10,
+            headers={"User-Agent": "golf-picks-advisor/1.0"},
+        )
+        if r.status_code != 200:
+            return {}
+        html = r.text
+        counts = {}
+        for m in re.finditer(
+            r'<td[^>]*>([A-Z][a-z]+(?:[\s\-][A-Z][a-z]+)+)</td>\s*<td[^>]*>(\d+)</td>',
+            html,
+        ):
+            counts[m.group(1).strip()] = int(m.group(2))
+        if not counts:
+            return {}
+        tm = max(total_members, 1)
+        return {n: round(min(c / tm * 100, 100), 1) for n, c in counts.items()}
+    except Exception as e:
+        print(f"    [WARN] MPSP usage fetch failed: {e}")
+        return {}
+
+
+def estimate_pick_pcts(candidates: list) -> dict:
+    """Estimate weekly pick% from win probabilities (pre-deadline proxy)."""
+    powered = {c["name"]: max(c.get("win_prob", 0.01), 0.01) ** 0.6 for c in candidates}
+    tp = sum(powered.values()) or 1.0
+    return {n: round(min(v / tp * 100, 30.0), 1) for n, v in powered.items()}
+
+
+def _lev_label(pick_pct: float) -> str:
+    if pick_pct >= 20: return "CHALK"
+    if pick_pct >= 10: return "popular"
+    if pick_pct >= 5:  return "moderate"
+    if pick_pct >= 2:  return "low"
+    return "contrarian"
+
+
+def _form_label(sg_total: float) -> str:
+    if sg_total > 1.5:  return "🔥"
+    if sg_total > 0.5:  return "✅"
+    if sg_total < -0.5: return "❄️"
+    return ""
+
+
+def _fuzzy_lookup(name: str, mapping: dict) -> float:
+    """Fuzzy-match name against a {name: float} dict."""
+    if name in mapping:
+        return float(mapping[name])
+    nl = name.lower()
+    for k, v in mapping.items():
+        if difflib.SequenceMatcher(None, nl, k.lower()).ratio() > 0.80:
+            return float(v)
+    return 0.0
+
+
+def filter_schedule_for_contest(rem: list, contest: str, cfg: dict) -> list:
+    if contest == "year":
+        return rem
+    if contest == "majors":
+        return [e for e in rem if e.get("is_major")]
+    if contest == "cup":
+        return [e for e in rem if
+                any(kw in e.get("event_name", "").lower() for kw in CUP_KEYWORDS)
+                or e.get("value_tier", 1) >= 4]
+    if contest in ("seg1", "seg2", "seg3", "seg4"):
+        segs = cfg.get("league", {}).get("segments", {})
+        seg  = segs.get(contest, {})
+        start_ev = seg.get("start_event", "").lower()
+        end_ev   = seg.get("end_event", "").lower()
+        if not start_ev:
+            return rem
+        out, in_seg = [], False
+        for e in rem:
+            en = e.get("event_name", "").lower()
+            if start_ev in en:
+                in_seg = True
+            if in_seg:
+                out.append(e)
+            if end_ev and end_ev in en:
+                in_seg = False
+        return out if out else rem
+    return rem
+
+
+_UI_FIELDS = frozenset({
+    "name", "owgr", "win_prob", "top10_prob", "pick_pct",
+    "headshot_url", "form_label", "save_event", "rival_burn_pct",
+    "leader_exclusivity_pct", "is_elite", "future_spots", "lev_label",
+    "final_score",
+})
+
+
+def score_field_ui(
+    field:          list,
+    rankings:       dict,
+    predictions:    dict,
+    tournament:     dict,
+    rem_schedule:   list,
+    course_history: dict,
+    used_lower:     set,
+    sg_profile:     dict,
+    weights:        dict,
+    pick_pcts:      dict = None,
+    usage_rates:    dict = None,
+) -> list:
+    """Score the field with 7 components for the web UI."""
+    course   = tournament.get("course", "")
+    purse    = float(tournament.get("purse", 0))
+    cur_tier = int(tournament.get("value_tier", 2))
+    profile  = sg_profile or _course_profile(course)
+
+    all_purses = [float(e.get("purse", 0)) for e in rem_schedule] + [purse]
+    purse_norm = purse / (max(all_purses) or 1)
+
+    pick_pcts   = pick_pcts   or {}
+    usage_rates = usage_rates or {}
+
+    candidates = []
+    for pl in field:
+        dg_id = pl["dg_id"]
+        name  = pl["name"]
+        norm  = _normalize_name(name)
+        if norm in used_lower:
+            continue
+        if any(difflib.SequenceMatcher(None, norm, u).ratio() > 0.85 for u in used_lower):
+            continue
+        stats = rankings.get(dg_id, {})
+        preds = predictions.get(dg_id, {})
+        if not stats and not preds:
+            continue
+        if stats.get("name"):
+            name = stats["name"]
+
+        owgr       = int(stats.get("owgr",    999))
+        win_prob   = float(preds.get("win_prob",      0.5))
+        top10_prob = float(preds.get("top10_prob",    5.0))
+
+        hist_bonus, hist_sum = _history_bonus(name, course_history)
+        wt_raw = win_prob * 3.0 + top10_prob
+        cf_raw = _sg_course_fit(stats, profile) + hist_bonus
+        fv_raw = future_value_score(stats, rem_schedule, cur_tier)
+        ps_raw = purse_norm
+
+        pct  = _fuzzy_lookup(name, pick_pcts)
+        burn = _fuzzy_lookup(name, usage_rates)
+        la_raw = max(0.0, 100.0 - burn) / 100.0
+        pl_raw = max(0.0, 1.0 - pct / 33.0)
+        le_raw = burn / 100.0
+
+        is_elite = owgr <= ELITE_RANK_CUTOFF
+        spots    = best_future_spots(stats, rem_schedule)
+        save_ev  = ""
+        if is_elite and spots and spots[0].get("tier", 1) >= 4:
+            save_ev = _short_name(spots[0]["event_name"])
+
+        candidates.append({
+            "name":                   name,
+            "owgr":                   owgr,
+            "win_prob":               round(win_prob, 1),
+            "top10_prob":             round(top10_prob, 1),
+            "pick_pct":               round(pct, 1),
+            "headshot_url":           "",
+            "form_label":             _form_label(float(stats.get("sg_total", 0))),
+            "save_event":             save_ev,
+            "rival_burn_pct":         round(burn, 1),
+            "leader_exclusivity_pct": round(burn, 1),
+            "is_elite":               is_elite,
+            "future_spots":           spots,
+            "_wt": wt_raw, "_cf": cf_raw, "_fv": fv_raw,
+            "_ps": ps_raw, "_la": la_raw, "_pl": pl_raw, "_le": le_raw,
+        })
+
+    if not candidates:
+        return []
+
+    def nv(key):
+        return _normalize([c[key] for c in candidates])
+
+    wt_n = nv("_wt"); cf_n = nv("_cf"); fv_n = nv("_fv")
+    la_n = nv("_la"); pl_n = nv("_pl"); le_n = nv("_le")
+    ps_v = purse_norm * 100
+
+    wsum = sum(weights.values()) or 1.0
+    w = {k: v / wsum for k, v in weights.items()}
+
+    for i, c in enumerate(candidates):
+        score = (w.get("win_top10",          0) * wt_n[i] +
+                 w.get("course_fit",         0) * cf_n[i] +
+                 w.get("future_value",       0) * fv_n[i] +
+                 w.get("purse_size",         0) * ps_v   +
+                 w.get("league_advantage",   0) * la_n[i] +
+                 w.get("pick_leverage",      0) * pl_n[i] +
+                 w.get("leader_exclusivity", 0) * le_n[i])
+        c["final_score"] = round(score, 1)
+        c["lev_label"]   = _lev_label(c["pick_pct"])
+
+    candidates.sort(key=lambda x: x["final_score"], reverse=True)
+    return [{k: v for k, v in c.items() if k in _UI_FIELDS} for c in candidates[:10]]
+
+
+def _ev_contests_this_week(tournament: dict) -> list:
+    out  = ["year"]
+    name = tournament.get("event_name", "").lower()
+    if tournament.get("is_major"):
+        out.append("majors")
+    if (any(kw in name for kw in CUP_KEYWORDS)
+            or tournament.get("value_tier", 1) >= 3
+            or tournament.get("is_elevated")):
+        out.append("cup")
+    return out
+
+
+# ── Global state shared with HTTP handler ────────────────────────────────────
+_APP_STATE: dict = {}
+
+
+class _GolfHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass  # suppress default access log
+
+    def _send_json(self, data, status: int = 200):
+        body = json.dumps(data).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_html(self, html: str, status: int = 200):
+        body = html.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path in ("/", "/index.html"):
+            self._serve_html()
+        elif path == "/baseline.json":
+            self._send_json(_APP_STATE.get("baseline", {}))
+        elif path == "/history":
+            self._send_json(load_pick_history())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path == "/run":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body   = json.loads(self.rfile.read(length))
+                result = self._run_model(body)
+                self._send_json(result)
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _serve_html(self):
+        st  = _APP_STATE
+        trn = st.get("tournament", {})
+        if not UI_HTML.exists():
+            self._send_html("<pre>golf_picks_ui.html not found</pre>", 500)
+            return
+        template = UI_HTML.read_text(encoding="utf-8")
+        purse = trn.get("purse", 0)
+        standings_html = ""
+        standings = st.get("standings", [])
+        if standings:
+            parts = [f"#{i+1} {t['name']}" for i, t in enumerate(standings[:5])]
+            standings_html = "Standings: " + "  |  ".join(parts)
+        prof_type = st.get("sg_profile", {}).get("type", "balanced")
+        html = (template
+            .replace("__TOURNAMENT_NAME__", trn.get("event_name", "—"))
+            .replace("__COURSE__",          trn.get("course", "—"))
+            .replace("__PURSE__",           f"${purse:,.0f}" if purse else "—")
+            .replace("__FIELD_SIZE__",      str(st.get("field_size", "—")))
+            .replace("__STANDINGS__",       standings_html)
+            .replace("__PROFILE_TYPE__",    prof_type)
+        )
+        self._send_html(html)
+
+    def _run_model(self, body: dict) -> dict:
+        st      = _APP_STATE
+        contest = body.get("contest", "year")
+        sg_raw  = body.get("sg", {})
+        wt_body = body.get("weights", {})
+        cfg     = st.get("cfg", {})
+
+        # Build SG profile from UI sliders (values are 0-1 fractions)
+        sg_profile = {
+            "sg_ott":  float(sg_raw.get("sg_ott",  0.25)),
+            "sg_app":  float(sg_raw.get("sg_app",  0.35)),
+            "sg_arg":  float(sg_raw.get("sg_arg",  0.15)),
+            "sg_putt": float(sg_raw.get("sg_putt", 0.25)),
+            "type":    "custom",
+        }
+        total = sum(sg_profile[k] for k in ("sg_ott", "sg_app", "sg_arg", "sg_putt"))
+        if total > 0:
+            for k in ("sg_ott", "sg_app", "sg_arg", "sg_putt"):
+                sg_profile[k] /= total
+
+        rem_for_contest = filter_schedule_for_contest(st["rem_schedule"], contest, cfg)
+
+        result = {}
+        for mode in ("conservative", "balanced", "chase"):
+            raw_w = wt_body.get(mode, MODE_WEIGHTS[mode])
+            # Convert percent (0-100) to fraction if the UI sends integers
+            if raw_w and max(raw_w.values(), default=0) > 1.5:
+                raw_w = {k: v / 100.0 for k, v in raw_w.items()}
+            result[mode] = score_field_ui(
+                field          = st["field"],
+                rankings       = st["rankings"],
+                predictions    = st["predictions"],
+                tournament     = st["tournament"],
+                rem_schedule   = rem_for_contest,
+                course_history = st["course_history"],
+                used_lower     = st["used_lower"],
+                sg_profile     = sg_profile,
+                weights        = raw_w,
+                pick_pcts      = st["pick_pcts"],
+                usage_rates    = st["usage_rates"],
+            )
+        return result
+
+
+def cmd_ui():
+    """Launch the interactive web UI at http://localhost:5051."""
+    print("\n  ⛳  Golf One-and-Done Picks Advisor — Web UI")
+    print("  ─────────────────────────────────────────────────")
+
+    api_key = get_api_key()
+    if not api_key:
+        print("  ERROR: DataGolf API key required. Run:  python golf_picks.py --config")
+        sys.exit(1)
+
+    cfg = load_cfg()
+
+    print("  → Fetching PGA Tour schedule...")
+    sched = fetch_schedule(api_key)
+
+    print("  → Detecting current tournament...")
+    tournament = detect_tournament(sched, api_key) or {
+        "event_name": "Unknown Tournament", "course": "Unknown Course",
+        "purse": 8_000_000, "start_date": str(date.today()),
+        "end_date": str(date.today() + timedelta(days=3)),
+        "value_tier": 2, "is_major": False, "is_elevated": False, "event_id": None,
+    }
+    print(f"     {tournament['event_name']}  @  {tournament.get('course', '')}")
+
+    print("  → Fetching field...")
+    field = fetch_field(api_key) or fetch_espn_field("")
+    print(f"     {len(field)} players")
+    if not field:
+        print("  ERROR: Could not retrieve field.")
+        sys.exit(1)
+
+    print("  → Fetching rankings & SG stats...")
+    rankings = fetch_rankings(api_key)
+
+    print("  → Fetching win probabilities...")
+    predictions = fetch_predictions(api_key)
+
+    event_id = tournament.get("event_id")
+    course_history = {}
+    if event_id:
+        print("  → Fetching course history...")
+        course_history = fetch_course_history(api_key, event_id)
+
+    rem = remaining_schedule(sched, tournament.get("event_name", ""))
+    print(f"  → {len(rem)} events remaining this season")
+
+    used_data  = load_used()
+    used_lower = used_names_set(used_data)
+
+    sg_profile = _course_profile(tournament.get("course", ""))
+
+    # Build candidate list for pick% estimation
+    tmp = [{"name": pl["name"],
+            "win_prob": float(predictions.get(pl["dg_id"], {}).get("win_prob", 0.5))}
+           for pl in field]
+    print("  → Estimating pick percentages...")
+    pick_pcts = estimate_pick_pcts(tmp)
+
+    total_members = cfg.get("league", {}).get("total_members", 20)
+    print("  → Fetching MPSP player usage...")
+    usage_rates = fetch_mpsp_usage(total_members)
+    if not usage_rates:
+        print("     (MPSP unavailable — league advantage estimated from win probability)")
+
+    purse = tournament.get("purse", 0)
+    baseline = {
+        "tournament":   tournament.get("event_name", ""),
+        "course":       tournament.get("course", ""),
+        "purse":        f"${purse:,.0f}" if purse else "—",
+        "field_size":   len(field),
+        "sg": {
+            "sg_ott":  sg_profile.get("sg_ott",  0.25),
+            "sg_app":  sg_profile.get("sg_app",  0.35),
+            "sg_arg":  sg_profile.get("sg_arg",  0.15),
+            "sg_putt": sg_profile.get("sg_putt", 0.25),
+        },
+        "weights":      MODE_WEIGHTS,
+        "weather":      None,
+        "weather_sg":   None,
+        "ev_contests":  _ev_contests_this_week(tournament),
+        "profile_type": sg_profile.get("type", "balanced"),
+    }
+
+    _APP_STATE.update({
+        "field":          field,
+        "rankings":       rankings,
+        "predictions":    predictions,
+        "tournament":     tournament,
+        "rem_schedule":   rem,
+        "course_history": course_history,
+        "used_lower":     used_lower,
+        "sg_profile":     sg_profile,
+        "pick_pcts":      pick_pcts,
+        "usage_rates":    usage_rates,
+        "baseline":       baseline,
+        "standings":      [],
+        "field_size":     len(field),
+        "cfg":            cfg,
+    })
+
+    if not UI_HTML.exists():
+        print(f"\n  ERROR: UI template not found: {UI_HTML}")
+        print("  Make sure golf_picks_ui.html is in the same directory as golf_picks.py.")
+        sys.exit(1)
+
+    server = HTTPServer(("127.0.0.1", UI_PORT), _GolfHandler)
+    url    = f"http://localhost:{UI_PORT}"
+    print(f"\n  Server running at  {url}")
+    print("  Press Ctrl+C to stop.\n")
+    threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n  Stopped.")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN
@@ -2554,62 +1659,38 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
-  python golf_picks.py                             # This week's top 10 picks
-  python golf_picks.py --contest cup               # Focus on Commissioner's Cup
-  python golf_picks.py --contest majors            # Focus on Majors contest
-  python golf_picks.py --mode chase                # Force aggressive strategy
-  python golf_picks.py --show-standings            # Show your standings in all contests
-  python golf_picks.py --league-setup              # Configure team name and segments
-  python golf_picks.py --focus driving             # Override SG focus to driving
+  python golf_picks.py                          # This week's top 10 picks
+  python golf_picks.py --focus driving          # Override SG focus to driving
+  python golf_picks.py --focus approach         # Override SG focus to approach
   python golf_picks.py --sg-weights ott=0.4,app=0.4,arg=0.1,putt=0.1  # Custom weights
-  python golf_picks.py --used "Scottie Scheffler"  # Log a player as used
-  python golf_picks.py --show-used                 # See used players list
-  python golf_picks.py --reset                     # New season — clear used list
-  python golf_picks.py --refresh                   # Flush cache, re-fetch everything
-  python golf_picks.py --config                    # Update DataGolf API key
+  python golf_picks.py --used "Scottie Scheffler"   # Log a player as used
+  python golf_picks.py --show-used              # See used players list
+  python golf_picks.py --reset                  # New season — clear used list
+  python golf_picks.py --refresh                # Flush cache, re-fetch everything
+  python golf_picks.py --config                 # Update DataGolf API key
 
-Contests: year | cup | majors | seg1 | seg2 | seg3 | seg4
 SG focus presets: driving, approach, putting, arg, balanced, ballstriking
-Modes: auto (default) | chase | conservative | balanced
 """)
-    parser.add_argument("--used",           metavar="PLAYER", help="Mark PLAYER as used this season")
-    parser.add_argument("--show-used",      action="store_true", help="Show used players list")
-    parser.add_argument("--reset",          action="store_true", help="Reset used players (new season)")
-    parser.add_argument("--refresh",        action="store_true", help="Clear cache and refresh all data")
-    parser.add_argument("--config",         action="store_true", help="Set/update DataGolf API key")
-    parser.add_argument("--league-setup",   action="store_true", help="Configure league: team name, segments")
-    parser.add_argument("--show-standings", action="store_true", help="Show your standings in all contests")
-    parser.add_argument("--contest",        metavar="CONTEST",
-                        choices=["year", "cup", "majors", "seg1", "seg2", "seg3", "seg4"],
-                        default=None,
-                        help="Focus contest for strategy mode: year, cup, majors, seg1-seg4")
-    parser.add_argument("--mode",           metavar="MODE",
-                        choices=["auto", "chase", "conservative", "balanced"],
-                        default="auto",
-                        help="Strategy mode override (default: auto — derived from standings)")
-    parser.add_argument("--focus",          metavar="PRESET",
+    parser.add_argument("--used",       metavar="PLAYER", help="Mark PLAYER as used this season")
+    parser.add_argument("--show-used",  action="store_true", help="Show used players list")
+    parser.add_argument("--reset",      action="store_true", help="Reset used players (new season)")
+    parser.add_argument("--refresh",    action="store_true", help="Clear cache and refresh all data")
+    parser.add_argument("--config",     action="store_true", help="Set/update DataGolf API key")
+    parser.add_argument("--focus",      metavar="PRESET",
                         choices=list(SG_FOCUS_PRESETS.keys()),
                         help="Override SG focus: driving, approach, putting, arg, balanced, ballstriking")
-    parser.add_argument("--sg-weights",     metavar="WEIGHTS",
+    parser.add_argument("--sg-weights", metavar="WEIGHTS",
                         help="Custom SG weights, e.g. ott=0.4,app=0.4,arg=0.1,putt=0.1")
-    parser.add_argument("--ui",             action="store_true",
-                        help="Launch interactive web UI for adjusting weights and running the model")
-    parser.add_argument("--log-result",     action="store_true",
-                        help="Log a tournament pick result to pick history (interactive prompt)")
+    parser.add_argument("--ui",         action="store_true",
+                        help=f"Launch interactive web UI at http://localhost:{UI_PORT}")
     args = parser.parse_args()
 
     # ── Simple sub-commands ───────────────────────────────────────────────────
     if args.ui:
-        cmd_ui(args)
-        return
-    if args.log_result:
-        cmd_log_result()
+        cmd_ui()
         return
     if args.config:
         cmd_config()
-        return
-    if args.league_setup:
-        cmd_setup_league()
         return
     if args.show_used:
         cmd_show_used()
@@ -2631,10 +1712,10 @@ Modes: auto (default) | chase | conservative | balanced
             for token in args.sg_weights.split(","):
                 k, v = token.strip().split("=")
                 parts[f"sg_{k.strip()}"] = float(v.strip())
-            total_w = sum(parts.values())
-            if abs(total_w - 1.0) > 0.01:
-                print(f"  [WARN] SG weights sum to {total_w:.2f}, not 1.0 — normalizing.")
-                parts = {k: v / total_w for k, v in parts.items()}
+            total = sum(parts.values())
+            if abs(total - 1.0) > 0.01:
+                print(f"  [WARN] SG weights sum to {total:.2f}, not 1.0 — normalizing.")
+                parts = {k: v / total for k, v in parts.items()}
             parts["type"] = "custom"
             sg_override = parts
         except Exception:
@@ -2651,10 +1732,6 @@ Modes: auto (default) | chase | conservative | balanced
         print("  ERROR: DataGolf API key is required.")
         print("  Run:  python golf_picks.py --config")
         sys.exit(1)
-
-    league_cfg = load_league_cfg()
-    my_team    = league_cfg.get("my_team", "")
-    my_owner   = league_cfg.get("my_owner", "")
 
     # 1. Schedule
     print("  → Fetching PGA Tour schedule...")
@@ -2677,7 +1754,7 @@ Modes: auto (default) | chase | conservative | balanced
             "is_elevated":False,
             "event_id":   None,
         }
-    t_name   = tournament.get("event_name", "")
+    t_name = tournament.get("event_name", "")
     t_course = tournament.get("course", "")
     print(f"     {t_name}  @  {t_course}")
 
@@ -2720,89 +1797,11 @@ Modes: auto (default) | chase | conservative | balanced
     used_data  = load_used()
     used_lower = used_names_set(used_data)
     used_count = len(used_lower)
-    print(f"  → {used_count} players already used this season")
+    print(f"  → {used_count} players already used this season\n")
 
-    # 9. MPSP league data
-    print("  → Fetching league usage data from MPSP site...")
-    usage_data = fetch_mpsp_golfer_usage(force=args.refresh)
-    print(f"     {len(usage_data)} players with league usage data")
-
-    print("  → Fetching current week pick data from MPSP site...")
-    pick_data, picks_available = fetch_mpsp_current_picks(force=args.refresh)
-    if picks_available:
-        print(f"     {len(pick_data)} players with actual pick counts (deadline passed)")
-    else:
-        print("     Pick data not yet available — will estimate from win probability")
-
-    print("  → Fetching league standings from MPSP site...")
-    standings = fetch_mpsp_standings(force=args.refresh)
-    year_count = len(standings.get("year", []))
-    print(f"     {year_count} entries in year-long standings")
-
-    # 10. Contest + strategy mode
-    ev_contests = all_contests_for_event(t_name, sched, league_cfg)
-    standings_ctx = my_standings_context(standings, my_team, my_owner) if (my_team or my_owner) else {}
-
-    # Determine active contest (CLI override > event type > year)
-    if args.contest:
-        active_contest = args.contest
-    elif tournament.get("is_major"):
-        active_contest = "majors"
-    elif any(kw in t_name.lower() for kw in COMMISSIONER_CUP_KEYWORDS):
-        active_contest = "cup"
-    else:
-        active_contest = "year"
-
-    # Determine strategy mode
-    if args.mode != "auto":
-        mode = args.mode
-    elif standings_ctx and active_contest in standings_ctx:
-        mode = standings_ctx[active_contest]["mode"]
-    else:
-        mode = "balanced"
-
-    active_weights = get_weights_for_mode(mode)
-    total_members  = detect_total_members(standings, usage_data,
-                                          league_cfg.get("total_members", 0))
-    mode_src = "manual override" if args.mode != "auto" else "auto from standings"
-    print(f"     Strategy mode: {mode.upper()}  ({mode_src}, contest: {active_contest},"
-          f" {total_members} league members)\n")
-
-    # 10b. Opponent inventory — teams ranked ahead of user in active contest
-    my_ctx      = standings_ctx.get(active_contest, {})
-    my_rank_cli = my_ctx.get("rank", 999) if my_ctx else 999
-    contest_standings_list = standings.get(active_contest, [])
-    # Build field last-name map for scorecard matching
-    _field_last_names: dict = {}
-    for _pl in field:
-        _norm = _normalize_name(_pl["name"])
-        _last = _norm.split()[-1]
-        _field_last_names.setdefault(_last, _norm)
-    if contest_standings_list and my_rank_cli < 999:
-        print("  → Building opponent inventory (teams ranked ahead)...")
-        opp_inventory, teams_ahead = fetch_opponent_inventory(
-            contest_standings_list, my_rank_cli, _field_last_names
-        )
-        if teams_ahead:
-            print(f"     {teams_ahead} opponents tracked, "
-                  f"{len(opp_inventory)} players in their inventories")
-        else:
-            print("     No opponent data available (check team name in --league-setup)")
-    else:
-        opp_inventory, teams_ahead = {}, 0
-
-    # --show-standings early exit
-    if args.show_standings:
-        if not standings_ctx:
-            print("  No standings data found. Run --league-setup to set your team name.")
-        else:
-            _print_contest_context(standings_ctx, ev_contests, active_contest, mode)
-        print()
-        return
-
-    # 11. Score — first pass with balanced weights to estimate pick %
+    # 9. Score
     print("  → Scoring eligible players...")
-    scored_prelim = score_field(
+    scored = score_field(
         field=field,
         rankings=rankings,
         predictions=predictions,
@@ -2811,370 +1810,20 @@ Modes: auto (default) | chase | conservative | balanced
         course_history=course_history,
         used_lower=used_lower,
         sg_override=sg_override,
-        usage_data=usage_data,
-        total_members=total_members,
-        active_weights=get_weights_for_mode("balanced"),
-        pick_data=pick_data if picks_available else None,
-        opp_inventory=opp_inventory,
-        teams_ahead=teams_ahead,
     )
-    # Estimate pick % from win probs if deadline hasn't passed yet
-    if not picks_available and scored_prelim:
-        est_pcts = estimate_pick_pcts(scored_prelim, total_members)
-    else:
-        est_pcts = None
+    print(f"     {len(scored)} eligible players scored\n")
 
-    # Score once per mode so user can choose
-    scored_by_mode: dict = {}
-    for mode_name in ["conservative", "balanced", "chase"]:
-        scored_by_mode[mode_name] = score_field(
-            field=field,
-            rankings=rankings,
-            predictions=predictions,
-            tournament=tournament,
-            rem_schedule=rem,
-            course_history=course_history,
-            used_lower=used_lower,
-            sg_override=sg_override,
-            usage_data=usage_data,
-            total_members=total_members,
-            active_weights=get_weights_for_mode(mode_name),
-            pick_data=pick_data if picks_available else None,
-            picks_estimated=est_pcts,
-            opp_inventory=opp_inventory,
-            teams_ahead=teams_ahead,
-        )
-    n_scored = len(scored_by_mode.get("balanced", []))
-    print(f"     {n_scored} eligible players scored\n")
-
-    if not n_scored:
+    if not scored:
         print("  No eligible players to recommend.")
         print("  (All players may be used, or data may be missing.)")
         sys.exit(0)
 
-    # Generate reasons for union of top-5 across all modes
-    seen_names: set = set()
-    for mode_name in ["conservative", "balanced", "chase"]:
-        for p in scored_by_mode[mode_name][:5]:
-            if p["name"] not in seen_names:
-                seen_names.add(p["name"])
-                p["reason"] = generate_reason(p, tournament, rem)
+    # 10. Add reasoning for top 10
+    for p in scored[:10]:
+        p["reason"] = generate_reason(p, tournament, rem)
 
-    # 12. Print report
-    print_report(
-        tournament, scored_by_mode, used_count, rem,
-        sg_profile=sg_override,
-        standings_ctx=standings_ctx,
-        ev_contests=ev_contests,
-        active_contest=active_contest,
-        auto_mode=mode,
-        sched=sched,
-        league_cfg=league_cfg,
-    )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# WEB UI  (python3 golf_picks.py --ui)
-# ══════════════════════════════════════════════════════════════════════════════
-
-_UI_STATE: dict = {}   # shared data between HTTP handler and scoring thread
-
-
-def _ui_score(custom: dict) -> dict:
-    """Re-score the field using custom SG + component weights. Returns top-8 per mode."""
-    s           = _UI_STATE
-    espn_ids    = s.get("espn_ids", {})
-    recent_form = s.get("recent_form", {})
-
-    # Contest-specific remaining schedule (#5 — Segment-Specific Mode)
-    contest = custom.get("contest", "year")
-    if contest != "year" and s.get("sched") and s.get("league_cfg"):
-        t_name    = s["tournament"].get("event_name", "")
-        rem_sched = remaining_for_contest(s["sched"], contest, t_name, s["league_cfg"])
-    else:
-        rem_sched = s["rem"]
-
-    # Normalize SG weights (user sliders may not sum to 1.0)
-    sg_raw   = custom.get("sg", {})
-    sg_total = sum(sg_raw.values()) or 1.0
-    sg_profile = {k: v / sg_total for k, v in sg_raw.items()}
-    sg_profile.setdefault("type", "custom")
-
-    results = {}
-    for mode_name in ("conservative", "balanced", "chase"):
-        raw_w   = custom.get("weights", {}).get(mode_name, get_weights_for_mode(mode_name))
-        w_total = sum(raw_w.values()) or 1.0
-        weights = {k: v / w_total for k, v in raw_w.items()}
-
-        scored = score_field(
-            field=s["field"], rankings=s["rankings"], predictions=s["predictions"],
-            tournament=s["tournament"], rem_schedule=rem_sched,
-            course_history=s["course_history"], used_lower=s["used_lower"],
-            sg_override=sg_profile, usage_data=s["usage_data"],
-            total_members=s["total_members"],
-            active_weights=weights,
-            pick_data=s["pick_data"] if s["picks_available"] else None,
-            picks_estimated=s["est_pcts"],
-            recent_form=recent_form,
-            opp_inventory=s.get("opp_inventory", {}),
-            teams_ahead=s.get("teams_ahead", 0),
-        )
-        picks = []
-        for p in scored[:8]:
-            display_name = (
-                (p["name"].split(",")[1].strip() + " " + p["name"].split(",")[0]).title()
-                if "," in p["name"] else p["name"].title()
-            )
-            norm = _normalize_name(display_name)
-            espn_id = espn_ids.get(norm, "")
-            headshot_url = (f"https://a.espncdn.com/i/headshots/golf/players/full/{espn_id}.png"
-                            if espn_id else "")
-            picks.append({
-                "name":         display_name,
-                "final_score":  round(p["final_score"], 1),
-                "win_prob":     round(p.get("win_prob", 0), 1),
-                "top10_prob":   round(p.get("top10_prob", 0), 1),
-                "pick_pct":     round(p.get("pick_pct", 0), 1),
-                "owgr":         p.get("owgr", 999),
-                "is_elite":     p.get("is_elite", False),
-                "lev_label":    pick_pct_label(p.get("pick_pct", 0)),
-                "form_label":   p.get("form_label", ""),
-                "save_event":   p.get("save_event", ""),
-                "headshot_url":          headshot_url,
-                "future_spots":          p.get("future_spots", []),
-                "leader_exclusivity_pct": p.get("leader_exclusivity_pct", 0),
-            })
-        results[mode_name] = picks
-    return results
-
-
-def _ui_baseline() -> dict:
-    s       = _UI_STATE
-    course  = s["tournament"].get("course", "")
-    profile = _course_profile(course)
-    weather = s.get("weather", {})
-    weather_profile = s.get("weather_profile", {})
-    sg_base = {k: profile[k] for k in ("sg_ott", "sg_app", "sg_arg", "sg_putt")}
-    sg_weather = (
-        {k: weather_profile.get(k, profile.get(k, 0)) for k in ("sg_ott", "sg_app", "sg_arg", "sg_putt")}
-        if weather_profile and weather_profile.get("type") == "weather-adjusted"
-        else None
-    )
-    return {
-        "sg": sg_base,
-        "weights": {
-            "conservative": dict(WEIGHTS_CONSERVATIVE),
-            "balanced":     dict(WEIGHTS_BALANCED),
-            "chase":        dict(WEIGHTS_CHASE),
-        },
-        "weather":         weather,
-        "weather_sg":      sg_weather,
-        "contest_labels":  CONTEST_LABELS,
-        "ev_contests":     s.get("ev_contests", []),
-        "teams_ahead":     s.get("teams_ahead", 0),
-    }
-
-
-def _ui_render_html() -> bytes:
-    s        = _UI_STATE
-    t        = s["tournament"]
-    baseline = _ui_baseline()
-    profile  = _course_profile(t.get("course", ""))
-
-    standings_parts = []
-    for contest, ctx in s.get("standings_ctx", {}).items():
-        lbl  = CONTEST_LABELS.get(contest, contest.upper())
-        rank = ctx["rank"]; total = ctx["total"]
-        g10  = ctx.get("gap_to_top10", 0)
-        tag  = "✓ TOP 10" if ctx.get("in_top10") else f"${g10:,.0f} to top 10"
-        standings_parts.append(f"{lbl}: #{rank}/{total} {tag}")
-    standings_str = " &nbsp;·&nbsp; ".join(standings_parts) or "—"
-
-    purse_m = f"${t.get('purse',0)/1e6:.1f}M" if t.get("purse") else "—"
-
-    profile_type = profile.get("type", "balanced")
-
-    html_path = Path(__file__).parent / "golf_picks_ui.html"
-    if not html_path.exists():
-        html_path = Path.home() / "golf_picks_ui.html"
-    template  = html_path.read_text(encoding="utf-8")
-
-    return (template
-        .replace("__TOURNAMENT_NAME__", t.get("event_name", "Unknown"))
-        .replace("__COURSE__",          t.get("course", ""))
-        .replace("__PURSE__",           purse_m)
-        .replace("__FIELD_SIZE__",      str(len(s.get("field", []))))
-        .replace("__STANDINGS__",       standings_str)
-        .replace("__PROFILE_TYPE__",    profile_type)
-    ).encode()
-
-
-class _UIHandler:
-    """Minimal HTTP request handler (no BaseHTTPRequestHandler subclass needed)."""
-    pass
-
-
-def cmd_ui(args):
-    """Fetch data once, then serve the interactive weight-tuning UI at localhost:5051."""
-    import threading
-    import webbrowser
-    import json as _json
-    from http.server import HTTPServer, BaseHTTPRequestHandler
-
-    # ── Fetch all data (same pipeline as main) ────────────────────────────────
-    print("\n  ⛳  Golf One-and-Done Picks Advisor  —  loading UI data...\n")
-    api_key = load_cfg().get("datagolf_api_key", "")
-    if not api_key:
-        print("  No API key. Run --config first.")
-        return
-
-    league_cfg    = load_league_cfg()
-    my_team       = league_cfg.get("my_team", "")
-    my_owner      = league_cfg.get("my_owner", "")
-
-    sched         = fetch_schedule(api_key)
-    tournament    = detect_tournament(sched, api_key)
-    if not tournament:
-        print("  Could not detect current tournament.")
-        return
-    t_name        = tournament.get("event_name", "")
-    field         = fetch_field(api_key)
-    rankings      = fetch_rankings(api_key)
-    predictions   = fetch_predictions(api_key)
-    event_id      = tournament.get("event_id")
-    course_history= fetch_course_history(api_key, event_id) if event_id else {}
-    rem           = remaining_schedule(sched, t_name)
-    used_data     = load_used()
-    used_lower    = used_names_set(used_data)
-    usage_data    = fetch_mpsp_golfer_usage(force=args.refresh)
-    pick_data, picks_available = fetch_mpsp_current_picks(force=args.refresh)
-    standings     = fetch_mpsp_standings(force=args.refresh)
-    ev_contests   = all_contests_for_event(t_name, sched, league_cfg)
-    standings_ctx = my_standings_context(standings, my_team, my_owner) if (my_team or my_owner) else {}
-    total_members = detect_total_members(standings, usage_data, league_cfg.get("total_members", 0))
-    recent_form   = fetch_recent_form()
-    espn_ids      = fetch_espn_ids()
-    weather       = fetch_weather(tournament.get("course", ""))
-    course_prof   = _course_profile(tournament.get("course", ""))
-    weather_prof  = weather_sg_adjustment(course_prof, weather) if weather else {}
-
-    sg_override = SG_FOCUS_PRESETS.get(getattr(args, "focus", None) or "", None)
-
-    # Determine active contest for opponent inventory
-    ui_active_contest = "year"
-    if tournament.get("is_major"):
-        ui_active_contest = "majors"
-    elif any(kw in t_name.lower() for kw in COMMISSIONER_CUP_KEYWORDS):
-        ui_active_contest = "cup"
-    ui_my_ctx    = my_standings_context(standings, my_team, my_owner) if (my_team or my_owner) else {}
-    ui_my_rank   = (ui_my_ctx.get(ui_active_contest) or {}).get("rank", 999)
-    ui_standings = standings.get(ui_active_contest, [])
-
-    # Build field last-name map
-    _ui_field_last_names: dict = {}
-    for _pl in field:
-        _norm = _normalize_name(_pl["name"])
-        _last = _norm.split()[-1]
-        _ui_field_last_names.setdefault(_last, _norm)
-
-    print("  → Building opponent inventory (teams ranked ahead)...")
-    opp_inventory, teams_ahead = fetch_opponent_inventory(
-        ui_standings, ui_my_rank, _ui_field_last_names
-    )
-    if teams_ahead:
-        print(f"     {teams_ahead} opponents tracked, "
-              f"{len(opp_inventory)} players in their inventories")
-    else:
-        print("     No opponent data available (configure team via --league-setup)")
-
-    # Prelim score for pick% estimation
-    scored_prelim = score_field(
-        field=field, rankings=rankings, predictions=predictions,
-        tournament=tournament, rem_schedule=rem, course_history=course_history,
-        used_lower=used_lower, sg_override=sg_override, usage_data=usage_data,
-        total_members=total_members, active_weights=get_weights_for_mode("balanced"),
-        pick_data=pick_data if picks_available else None,
-        recent_form=recent_form,
-        opp_inventory=opp_inventory, teams_ahead=teams_ahead,
-    )
-    est_pcts = estimate_pick_pcts(scored_prelim, total_members) if not picks_available else None
-
-    _UI_STATE.update({
-        "field": field, "rankings": rankings, "predictions": predictions,
-        "tournament": tournament, "rem": rem, "course_history": course_history,
-        "used_lower": used_lower, "usage_data": usage_data,
-        "total_members": total_members, "pick_data": pick_data,
-        "picks_available": picks_available, "est_pcts": est_pcts,
-        "standings_ctx": standings_ctx, "recent_form": recent_form,
-        "espn_ids": espn_ids,
-        "sched": sched, "league_cfg": league_cfg, "ev_contests": ev_contests,
-        "weather": weather, "weather_profile": weather_prof,
-        "opp_inventory": opp_inventory, "teams_ahead": teams_ahead,
-    })
-
-    # ── HTTP server ───────────────────────────────────────────────────────────
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *a): pass   # silence access log
-
-        def do_GET(self):
-            if self.path in ("/", "/index.html"):
-                body = _ui_render_html()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            elif self.path == "/baseline.json":
-                body = _json.dumps(_ui_baseline()).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            elif self.path == "/history":
-                body = _json.dumps(load_pick_history()).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            else:
-                self.send_response(404); self.end_headers()
-
-        def do_POST(self):
-            if self.path == "/run":
-                length  = int(self.headers.get("Content-Length", 0))
-                payload = _json.loads(self.rfile.read(length))
-                result  = _ui_score(payload)
-                body    = _json.dumps(result).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            else:
-                self.send_response(404); self.end_headers()
-
-    PORT   = 5051
-    server = HTTPServer(("0.0.0.0", PORT), Handler)   # bind all interfaces (IPv4 + IPv6)
-    url    = f"http://127.0.0.1:{PORT}"               # use explicit IP to avoid macOS IPv6 issue
-    wx_cond = weather.get("condition", "")
-    wx_info = (f"  Weather: {wx_cond} ({weather.get('wind_mph_max',0):.0f} mph wind, "
-               f"{weather.get('precip_mm_total',0):.1f}mm rain)") if weather else ""
-    print(f"  Web UI ready →  {url}")
-    print(f"  Serving {t_name}  |  {total_members} league members")
-    if wx_info:
-        print(wx_info)
-    print(f"  Press Ctrl+C to stop.\n")
-    threading.Timer(0.6, lambda: webbrowser.open(url)).start()
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\n  Web UI stopped.")
-
-
-# ── Embedded HTML fallback (also written to golf_picks_ui.html on first run) ─
-_UI_HTML = ""  # populated below — see golf_picks_ui.html
+    # 11. Print report
+    print_report(tournament, scored, used_count, rem, sg_profile=sg_override)
 
 
 if __name__ == "__main__":

@@ -72,6 +72,8 @@ tr:hover td{background:#162032}
 .td-star{color:#fbbf24}
 .td-score{font-weight:700;color:#38bdf8}
 .td-diff{color:#a78bfa;font-weight:600}
+.td-rival{color:#fb923c;font-weight:600;font-size:12px}
+.td-rival-zero{color:#475569;font-size:12px}
 .lev-CHALK{color:#f87171}.lev-popular{color:#fb923c}.lev-moderate{color:#facc15}
 .lev-low{color:#86efac}.lev-contrarian{color:#67e8f9}
 
@@ -410,6 +412,7 @@ async function runModel() {
     if (!resp.ok) throw new Error('Server error '+resp.status);
     const data = await resp.json();
     console.log('[golf] future_spots sample:', JSON.stringify(data?.conservative?.[0]?.future_spots));
+    console.log('[golf] rival_burn_pct sample:', data?.balanced?.slice(0,3).map(p=>`${p.name}: ${p.rival_burn_pct}`));
     renderResults(data);
   } catch(e) {
     document.getElementById('results-content').innerHTML =
@@ -487,7 +490,7 @@ function renderResults(data) {
     const picks    = data[mode] || [];
     const meta     = MODE_META[mode];
     const isChase  = mode === 'chase';
-    const colCount = isChase ? 8 : 7;
+    const colCount = isChase ? 9 : 8;
     html += `
       <div class="mode-block">
         <div class="mode-header ${meta.cls}">
@@ -498,8 +501,10 @@ function renderResults(data) {
           <thead><tr>
             <th>#</th><th>Player</th><th>Score</th>
             ${isChase
-              ? '<th>Win%</th><th>T10%</th><th>Pick%</th><th title="Win% × (1 − Pick%) — exclusive upside">DiffWin%</th><th>Leverage</th>'
-              : '<th>OWGR</th><th>T10%</th><th>Pick%</th><th>Leverage</th>'}
+              ? '<th>Win%</th><th>T10%</th><th>Pick%</th><th title="Win% × (1 − Pick%) — exclusive upside">DiffWin%</th>'
+              : '<th>OWGR</th><th>T10%</th><th>Pick%</th>'}
+            <th title="% of all teams ranked ahead of you (season, segment, majors &amp; cup) who have already burned this player">Rival%</th>
+            <th>Leverage</th>
           </tr></thead>
           <tbody>`;
     picks.forEach((p, i) => {
@@ -533,16 +538,22 @@ function renderResults(data) {
         <td class="td-rank"><span class="expand-icon" id="icon_${spotId}">▶</span>${i+1}</td>
         <td><div class="player-cell">${imgHtml}<div class="player-name-wrap"><span>${star}${p.name}</span>${badges}</div></div></td>
         <td class="td-score">${p.final_score}</td>`;
+      const rivalPct  = p.rival_burn_pct || 0;
+      const rivalCell = rivalPct > 0
+        ? `<td class="td-rival" title="${rivalPct}% of all rivals burned this player">${rivalPct}%</td>`
+        : `<td class="td-rival td-rival-zero">—</td>`;
       if (isChase) {
         html += `<td>${p.win_prob}%</td>
                  <td>${p.top10_prob}%</td>
                  <td class="lev-${lev}">${p.pick_pct}%</td>
                  <td class="td-diff">${diffWin}%</td>
+                 ${rivalCell}
                  <td class="lev-${lev}">${lev}</td>`;
       } else {
         html += `<td>#${p.owgr}</td>
                  <td>${p.top10_prob}%</td>
                  <td class="lev-${lev}">${p.pick_pct}%</td>
+                 ${rivalCell}
                  <td class="lev-${lev}">${lev}</td>`;
       }
       html += `</tr>`;
