@@ -227,6 +227,66 @@ tr:hover td{background:#162032}
 let BASELINE = null;
 let cur = null;
 
+// ── Static-mode helpers (used when data is embedded at generation time) ─────
+function _normalizeArr(arr) {
+  const mn = Math.min(...arr), mx = Math.max(...arr);
+  if (mx === mn) return arr.map(() => 50);
+  return arr.map(v => (v - mn) / (mx - mn) * 100);
+}
+
+function _levLabel(pct) {
+  if (pct >= 20) return 'CHALK';
+  if (pct >= 10) return 'popular';
+  if (pct >= 5)  return 'moderate';
+  if (pct >= 2)  return 'low';
+  return 'contrarian';
+}
+
+// Client-side scoring — uses pre-normalized scores embedded in the static file.
+// Course fit is recomputed from raw SG values so SG profile sliders stay live.
+function scoreClientSide(payload) {
+  const sg    = payload.sg    || (cur && cur.sg)    || {};
+  const w_all = payload.weights || (cur && cur.weights) || {};
+  const players = (typeof __STATIC_PLAYER_DATA__ !== 'undefined') ? __STATIC_PLAYER_DATA__ : [];
+  if (!players.length) return {conservative:[], balanced:[], chase:[]};
+
+  // Recompute course-fit raw values with current SG profile weights
+  const sgOtt  = sg.sg_ott  || 0.25;
+  const sgApp  = sg.sg_app  || 0.35;
+  const sgArg  = sg.sg_arg  || 0.15;
+  const sgPutt = sg.sg_putt || 0.25;
+  const cfRaws = players.map(p =>
+    p.sg_ott * sgOtt + p.sg_app * sgApp + p.sg_arg * sgArg + p.sg_putt * sgPutt + p.history_bonus
+  );
+  const cf_n = _normalizeArr(cfRaws);
+
+  const result = {};
+  for (const mode of ['conservative','balanced','chase']) {
+    const w    = w_all[mode] || {};
+    const wsum = Object.values(w).reduce((a,b) => a+b, 0) || 1;
+    const scored = players.map((p, i) => ({
+      ...p,
+      final_score: Math.round((
+        (w.win_top10          || 0) / wsum * p.wt_n    +
+        (w.course_fit         || 0) / wsum * cf_n[i]   +
+        (w.future_value       || 0) / wsum * p.fv_n    +
+        (w.purse_size         || 0) / wsum * p.ps_v    +
+        (w.league_advantage   || 0) / wsum * p.la_n    +
+        (w.pick_leverage      || 0) / wsum * p.pl_n    +
+        (w.leader_exclusivity || 0) / wsum * p.le_n
+      ) * 10) / 10,
+      lev_label: _levLabel(p.pick_pct),
+    }));
+    scored.sort((a, b) => b.final_score - a.final_score);
+    result[mode] = scored.slice(0, 10);
+  }
+  return result;
+}
+
+function _isStatic() {
+  return typeof __STATIC_BASELINE__ !== 'undefined';
+}
+
 // ── Constants ─────────────────────────────────────────────────────────────
 const SG_KEYS   = ['sg_ott','sg_app','sg_arg','sg_putt'];
 const SG_LABELS = {sg_ott:'Off The Tee',sg_app:'Approach',sg_arg:'Around Green',sg_putt:'Putting'};
@@ -404,15 +464,20 @@ async function runModel() {
   try {
     const contest = document.getElementById('contest-select')?.value || 'year';
     const payload = Object.assign({}, cur, { contest });
-    const resp = await fetch('/run', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify(payload)
-    });
-    if (!resp.ok) throw new Error('Server error '+resp.status);
-    const data = await resp.json();
-    console.log('[golf] future_spots sample:', JSON.stringify(data?.conservative?.[0]?.future_spots));
-    console.log('[golf] rival_burn_pct sample:', data?.balanced?.slice(0,3).map(p=>`${p.name}: ${p.rival_burn_pct}`));
+    let data;
+    if (_isStatic()) {
+      // Static mode: score entirely in-browser using embedded player data
+      data = scoreClientSide(payload);
+    } else {
+      // Server mode: POST to Python backend
+      const resp = await fetch('/run', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(payload)
+      });
+      if (!resp.ok) throw new Error('Server error '+resp.status);
+      data = await resp.json();
+    }
     renderResults(data);
   } catch(e) {
     document.getElementById('results-content').innerHTML =
@@ -614,8 +679,13 @@ async function toggleHistory() {
   if (_historyLoaded) return;
   _historyLoaded = true;
   try {
-    const resp = await fetch('/history');
-    const data = await resp.json();
+    let data;
+    if (_isStatic()) {
+      data = (typeof __STATIC_HISTORY__ !== 'undefined') ? __STATIC_HISTORY__ : [];
+    } else {
+      const resp = await fetch('/history');
+      data = await resp.json();
+    }
     if (!data.length) {
       content.innerHTML = '<div class="history-empty">No picks logged yet. Use <code>python3 golf_picks.py --log-result</code> to add entries.</div>';
       return;
@@ -650,18 +720,32 @@ async function toggleHistory() {
 // ── Init ───────────────────────────────────────────────────────────────────
 (async function() {
   try {
-    const resp = await fetch('/baseline.json');
-    if (!resp.ok) throw new Error('baseline fetch failed: ' + resp.status);
-    BASELINE = await resp.json();
-    cur = JSON.parse(JSON.stringify(BASELINE));
-    buildSgSliders();
-    buildModePanels();
-    buildWeatherBanner(BASELINE.weather);
-    buildContestSelector(BASELINE.ev_contests);
+    if (_isStatic()) {
+      // Static mode — data embedded at generation time, no server needed
+      BASELINE = __STATIC_BASELINE__;
+      cur = JSON.parse(JSON.stringify(BASELINE));
+      buildSgSliders();
+      buildModePanels();
+      buildWeatherBanner(BASELINE.weather);
+      buildContestSelector(BASELINE.ev_contests);
+      // Auto-run with default weights so picks appear immediately on open
+      await runModel();
+    } else {
+      // Server mode — fetch from Python backend
+      const resp = await fetch('/baseline.json');
+      if (!resp.ok) throw new Error('baseline fetch failed: ' + resp.status);
+      BASELINE = await resp.json();
+      cur = JSON.parse(JSON.stringify(BASELINE));
+      buildSgSliders();
+      buildModePanels();
+      buildWeatherBanner(BASELINE.weather);
+      buildContestSelector(BASELINE.ev_contests);
+    }
   } catch(e) {
     document.body.innerHTML = `<div style="color:#f87171;padding:40px;font-family:monospace">
       <h2>Failed to load baseline data</h2><p>${e.message}</p>
-      <p>Make sure the server is running: <code>python3 golf_picks.py --ui</code></p>
+      <p>In static mode: re-generate with <code>python3 golf_picks.py --generate-html</code><br>
+      In server mode: <code>python3 golf_picks.py --ui</code></p>
     </div>`;
   }
 })();

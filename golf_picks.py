@@ -49,10 +49,11 @@ DATA_DIR          = BASE_DIR / "golf_data"
 CACHE_DIR         = DATA_DIR / "cache"
 USED_FILE         = DATA_DIR / "used_players.json"
 CFG_FILE          = DATA_DIR / "config.json"
-PICK_HISTORY_FILE = DATA_DIR / "pick_history.json"
-UI_HTML           = BASE_DIR / "golf_picks_ui.html"
-UI_PORT           = 5051
-MPSP_BASE         = "https://mpsp.protourfantasygolf.com"
+PICK_HISTORY_FILE  = DATA_DIR / "pick_history.json"
+UI_HTML            = BASE_DIR / "golf_picks_ui.html"
+STATIC_HTML_OUTPUT = BASE_DIR / "golf_picks.html"
+UI_PORT            = 5051
+MPSP_BASE          = "https://mpsp.protourfantasygolf.com"
 
 DATA_DIR.mkdir(exist_ok=True)
 CACHE_DIR.mkdir(exist_ok=True)
@@ -1186,6 +1187,243 @@ def print_report(tournament: dict, picks: list[dict],
     print(f"{DIV}\n")
 
 # ══════════════════════════════════════════════════════════════════════════════
+# MONDAY AUTO-REFRESH
+# ══════════════════════════════════════════════════════════════════════════════
+
+def maybe_refresh_monday():
+    """Clear cache on Mondays so every week opens with fresh data."""
+    if date.today().weekday() != 0:      # 0 = Monday
+        return
+    cfg      = load_cfg()
+    today_s  = str(date.today())
+    if cfg.get("last_monday_refresh") == today_s:
+        return                             # already refreshed today
+    print("  → Monday detected — auto-clearing cache for fresh weekly data...")
+    clear_cache()
+    cfg["last_monday_refresh"] = today_s
+    save_cfg(cfg)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STATIC HTML GENERATION  (python golf_picks.py --generate-html)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_static_player_data(
+    field, rankings, predictions, tournament, rem_schedule,
+    course_history, used_lower, sg_profile, pick_pcts, usage_rates,
+) -> list:
+    """
+    Compute pre-normalized component scores for all eligible players.
+    Returns player dicts with raw SG values + normalized scores so the
+    browser can re-score with arbitrary weights and SG profiles client-side.
+    """
+    course   = tournament.get("course", "")
+    purse    = float(tournament.get("purse", 0))
+    cur_tier = int(tournament.get("value_tier", 2))
+    profile  = sg_profile or _course_profile(course)
+
+    all_purses = [float(e.get("purse", 0)) for e in rem_schedule] + [purse]
+    ps_v = round(purse / (max(all_purses) or 1) * 100, 2)   # same for all
+
+    pick_pcts   = pick_pcts   or {}
+    usage_rates = usage_rates or {}
+
+    raw = []
+    for pl in field:
+        dg_id = pl["dg_id"]
+        name  = pl["name"]
+        norm  = _normalize_name(name)
+        if norm in used_lower:
+            continue
+        if any(difflib.SequenceMatcher(None, norm, u).ratio() > 0.85 for u in used_lower):
+            continue
+        stats = rankings.get(dg_id, {})
+        preds = predictions.get(dg_id, {})
+        if not stats and not preds:
+            continue
+        if stats.get("name"):
+            name = stats["name"]
+
+        owgr       = int(stats.get("owgr", 999))
+        win_prob   = float(preds.get("win_prob",   0.5))
+        top10_prob = float(preds.get("top10_prob", 5.0))
+
+        hist_bonus, _ = _history_bonus(name, course_history)
+        wt_raw = win_prob * 3.0 + top10_prob
+        fv_raw = future_value_score(stats, rem_schedule, cur_tier)
+
+        pct  = _fuzzy_lookup(name, pick_pcts)
+        burn = _fuzzy_lookup(name, usage_rates)
+        la_raw = max(0.0, 100.0 - burn) / 100.0
+        pl_raw = max(0.0, 1.0 - pct / 33.0)
+        le_raw = burn / 100.0
+
+        is_elite = owgr <= ELITE_RANK_CUTOFF
+        spots    = best_future_spots(stats, rem_schedule)
+        save_ev  = ""
+        if is_elite and spots and spots[0].get("tier", 1) >= 4:
+            save_ev = _short_name(spots[0]["event_name"])
+
+        raw.append({
+            "name":    name,    "owgr":  owgr,
+            "win_prob":  round(win_prob, 1),  "top10_prob": round(top10_prob, 1),
+            "pick_pct":  round(pct, 1),
+            "headshot_url":           "",
+            "form_label":             _form_label(float(stats.get("sg_total", 0))),
+            "save_event":             save_ev,
+            "rival_burn_pct":         round(burn, 1),
+            "leader_exclusivity_pct": round(burn, 1),
+            "is_elite":    is_elite,
+            "future_spots": spots,
+            # Raw SG values — browser recomputes course_fit when sliders move
+            "sg_ott":       round(float(stats.get("sg_ott",  0)), 4),
+            "sg_app":       round(float(stats.get("sg_app",  0)), 4),
+            "sg_arg":       round(float(stats.get("sg_arg",  0)), 4),
+            "sg_putt":      round(float(stats.get("sg_putt", 0)), 4),
+            "history_bonus": round(hist_bonus, 4),
+            # Pre-normalized component scores (0-100, except ps_v added below)
+            "_wt": wt_raw, "_fv": fv_raw,
+            "_la": la_raw, "_pl": pl_raw, "_le": le_raw,
+        })
+
+    if not raw:
+        return []
+
+    def nv(key):
+        return _normalize([c[key] for c in raw])
+
+    wt_n = nv("_wt"); fv_n = nv("_fv")
+    la_n = nv("_la"); pl_n = nv("_pl"); le_n = nv("_le")
+
+    result = []
+    for i, c in enumerate(raw):
+        d = {k: v for k, v in c.items() if not k.startswith("_")}
+        d.update({
+            "wt_n": round(wt_n[i], 2), "fv_n": round(fv_n[i], 2), "ps_v": ps_v,
+            "la_n": round(la_n[i], 2), "pl_n": round(pl_n[i], 2), "le_n": round(le_n[i], 2),
+        })
+        result.append(d)
+    return result
+
+
+def generate_static_html():
+    """Generate golf_picks.html — a self-contained file you can double-click."""
+    print("\n  ⛳  Golf One-and-Done Picks Advisor — Generating Static HTML")
+    print("  ─────────────────────────────────────────────────────────────")
+
+    maybe_refresh_monday()
+
+    api_key = get_api_key()
+    if not api_key:
+        print("  ERROR: DataGolf API key required. Run:  python golf_picks.py --config")
+        sys.exit(1)
+
+    cfg = load_cfg()
+
+    print("  → Fetching PGA Tour schedule...")
+    sched = fetch_schedule(api_key)
+
+    print("  → Detecting current tournament...")
+    tournament = detect_tournament(sched, api_key) or {
+        "event_name": "Unknown Tournament", "course": "Unknown Course",
+        "purse": 8_000_000, "start_date": str(date.today()),
+        "end_date": str(date.today() + timedelta(days=3)),
+        "value_tier": 2, "is_major": False, "is_elevated": False, "event_id": None,
+    }
+    print(f"     {tournament['event_name']}  @  {tournament.get('course', '')}")
+
+    print("  → Fetching field...")
+    field = fetch_field(api_key) or fetch_espn_field("")
+    print(f"     {len(field)} players")
+    if not field:
+        print("  ERROR: Could not retrieve field.")
+        sys.exit(1)
+
+    print("  → Fetching rankings & SG stats...")
+    rankings = fetch_rankings(api_key)
+
+    print("  → Fetching win probabilities...")
+    predictions = fetch_predictions(api_key)
+
+    event_id = tournament.get("event_id")
+    course_history = {}
+    if event_id:
+        print("  → Fetching course history...")
+        course_history = fetch_course_history(api_key, event_id)
+
+    rem = remaining_schedule(sched, tournament.get("event_name", ""))
+    print(f"  → {len(rem)} events remaining this season")
+
+    used_data  = load_used()
+    used_lower = used_names_set(used_data)
+    sg_profile = _course_profile(tournament.get("course", ""))
+
+    tmp = [{"name": pl["name"],
+            "win_prob": float(predictions.get(pl["dg_id"], {}).get("win_prob", 0.5))}
+           for pl in field]
+    pick_pcts   = estimate_pick_pcts(tmp)
+    total_members = cfg.get("league", {}).get("total_members", 20)
+    usage_rates = fetch_mpsp_usage(total_members)
+
+    print("  → Scoring all eligible players...")
+    player_data = _build_static_player_data(
+        field, rankings, predictions, tournament, rem, course_history,
+        used_lower, sg_profile, pick_pcts, usage_rates,
+    )
+    print(f"     {len(player_data)} players embedded")
+
+    purse    = tournament.get("purse", 0)
+    baseline = {
+        "tournament":   tournament.get("event_name", ""),
+        "course":       tournament.get("course", ""),
+        "purse":        f"${purse:,.0f}" if purse else "—",
+        "field_size":   len(field),
+        "sg": {
+            "sg_ott":  sg_profile.get("sg_ott",  0.25),
+            "sg_app":  sg_profile.get("sg_app",  0.35),
+            "sg_arg":  sg_profile.get("sg_arg",  0.15),
+            "sg_putt": sg_profile.get("sg_putt", 0.25),
+        },
+        "weights":      MODE_WEIGHTS,
+        "weather":      None,
+        "weather_sg":   None,
+        "ev_contests":  _ev_contests_this_week(tournament),
+        "profile_type": sg_profile.get("type", "balanced"),
+    }
+    history = load_pick_history()
+
+    if not UI_HTML.exists():
+        print(f"  ERROR: Template not found: {UI_HTML}")
+        sys.exit(1)
+
+    template = UI_HTML.read_text(encoding="utf-8")
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    static_script = (
+        f'<script>\n'
+        f'// Generated by golf_picks.py on {generated_at}\n'
+        f'const __STATIC_BASELINE__    = {json.dumps(baseline, separators=(",",":"))};\n'
+        f'const __STATIC_PLAYER_DATA__ = {json.dumps(player_data, separators=(",",":"))};\n'
+        f'const __STATIC_HISTORY__     = {json.dumps(history, separators=(",",":"))};\n'
+        f'</script>\n'
+    )
+
+    html = (template
+        .replace("__TOURNAMENT_NAME__", tournament.get("event_name", "—"))
+        .replace("__COURSE__",          tournament.get("course", "—"))
+        .replace("__PURSE__",           f"${purse:,.0f}" if purse else "—")
+        .replace("__FIELD_SIZE__",      str(len(field)))
+        .replace("__STANDINGS__",       "")
+        .replace("__PROFILE_TYPE__",    sg_profile.get("type", "balanced"))
+        .replace("<body>",              f"<body>\n{static_script}", 1)
+    )
+
+    STATIC_HTML_OUTPUT.write_text(html, encoding="utf-8")
+    size_kb = STATIC_HTML_OUTPUT.stat().st_size // 1024
+    print(f"\n  ✓  Generated: {STATIC_HTML_OUTPUT}  ({size_kb} KB)")
+    print(f"     Double-click to open, or:  open '{STATIC_HTML_OUTPUT}'")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # WEB UI  (python golf_picks.py --ui)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1537,6 +1775,8 @@ def cmd_ui():
     print("\n  ⛳  Golf One-and-Done Picks Advisor — Web UI")
     print("  ─────────────────────────────────────────────────")
 
+    maybe_refresh_monday()
+
     api_key = get_api_key()
     if not api_key:
         print("  ERROR: DataGolf API key required. Run:  python golf_picks.py --config")
@@ -1681,13 +1921,18 @@ SG focus presets: driving, approach, putting, arg, balanced, ballstriking
                         help="Override SG focus: driving, approach, putting, arg, balanced, ballstriking")
     parser.add_argument("--sg-weights", metavar="WEIGHTS",
                         help="Custom SG weights, e.g. ott=0.4,app=0.4,arg=0.1,putt=0.1")
-    parser.add_argument("--ui",         action="store_true",
+    parser.add_argument("--ui",            action="store_true",
                         help=f"Launch interactive web UI at http://localhost:{UI_PORT}")
+    parser.add_argument("--generate-html", action="store_true",
+                        help=f"Generate self-contained {STATIC_HTML_OUTPUT.name} (double-click to open)")
     args = parser.parse_args()
 
     # ── Simple sub-commands ───────────────────────────────────────────────────
     if args.ui:
         cmd_ui()
+        return
+    if args.generate_html:
+        generate_static_html()
         return
     if args.config:
         cmd_config()
@@ -1725,6 +1970,7 @@ SG focus presets: driving, approach, putting, arg, balanced, ballstriking
         sg_override = SG_FOCUS_PRESETS[args.focus]
 
     # ── Weekly picks run ──────────────────────────────────────────────────────
+    maybe_refresh_monday()
     print("\n  ⛳  Golf One-and-Done Picks Advisor  —  fetching data...\n")
 
     api_key = get_api_key()
